@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec.bak
+
+# Real deal outputs / Data Disks should never be committed
+*.xlsx
+*.docx
+!/samples/**/*.xlsx
+!/samples/**/*.docx
