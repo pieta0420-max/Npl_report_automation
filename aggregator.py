@@ -272,8 +272,20 @@ def table_region(collateral_df: pd.DataFrame, config: dict,
 def table_region_x_property_matrix(collateral_df: pd.DataFrame, config: dict,
                                      unclassified_p: Set[str], unclassified_r: Set[str]) -> pd.DataFrame:
     """(*) 지역별/물건별 OPB 비중 matrix, one block per pool."""
-    p_groups = config["property_type_groups"]
     r_groups = config["region_groups"]
+
+    # Only property-type groups that actually have SOME collateral
+    # somewhere in this deal become matrix columns -- config can define a
+    # group (e.g. 기계기구 등) that this particular deal's collateral never
+    # actually uses, and iterating config["property_type_groups"] blindly
+    # would still give it a column, permanently reading 0% (confirmed by
+    # testing: 양도담보 showed up this way, occupying a column purely
+    # because it was configured, not because any borrower's collateral was
+    # ever classified into it). Matches table_property_type's own "유사
+    # 유형" grouping, which already only lists groups with real members.
+    all_pgroups = collateral_df["property_type"].apply(lambda v: property_group(v, config, unclassified_p))
+    used_pgroups = set(all_pgroups)
+    p_groups = [g for g in config["property_type_groups"] if g in used_pgroups]
 
     rows = []
     for pool in sorted(x for x in collateral_df["pool_type"].dropna().unique()):

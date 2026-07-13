@@ -443,37 +443,53 @@ def _ensure_matrix_columns(table, n_groups: int) -> None:
     whatever the template's property-type-group count happened to be when
     it was last built for a prior deal -- e.g. this template's Pool B/C
     matrix tables only have 5 data-column slots (7 total with 구분/합계).
-    If the current deal's classification_config.json defines MORE groups
-    than that (this deal's 6 groups already exceeds it), the header-
-    rewrite would silently overflow into and overwrite the 합계 column
-    with the last group's name, losing the true total column entirely.
-    Inserting the missing columns right before 합계 (so 합계 stays the
-    rightmost column), then rescaling every column's width from the
-    table's original total width, keeps the table the same overall size
-    while making room for the extra group(s)."""
+    If the current deal has MORE groups than that, the header-rewrite
+    would silently overflow into and overwrite the 합계 column with the
+    last group's name, losing the true total column entirely -- so missing
+    columns are inserted right before 합계 (keeping it the rightmost
+    column). If the current deal has FEWER actually-used groups than the
+    table has slots for (a deal's collateral might not touch every group
+    classification_config.json defines, e.g. no 특수부동산 collateral at
+    all), the excess data columns are deleted instead, for the same reason
+    in reverse: leaving them would let _rewrite_matrix_header only cover
+    the first N columns, leaving stale labels/합계 sitting in the wrong
+    position on the untouched trailing columns. Either way, every
+    column's width is rescaled from the table's original total width
+    afterward, keeping the table the same overall size."""
     current_data_cols = table.Columns.Count - 2  # minus 구분, 합계
     extra = n_groups - current_data_cols
-    if extra <= 0:
+    if extra == 0:
         return
     original_total_width = sum(table.Columns(c).Width for c in range(1, table.Columns.Count + 1))
-    ref_header_cell = table.Cell(1, 2)  # an existing data-group header cell, used as the new columns' format template
-    insert_before_idx = table.Columns.Count  # 합계's current position
-    for _ in range(extra):
-        table.Columns.Add(BeforeColumn=table.Columns(insert_before_idx))
-        insert_before_idx += 1
+
+    if extra > 0:
+        ref_header_cell = table.Cell(1, 2)  # an existing data-group header cell, used as the new columns' format template
+        insert_before_idx = table.Columns.Count  # 합계's current position
+        for _ in range(extra):
+            table.Columns.Add(BeforeColumn=table.Columns(insert_before_idx))
+            insert_before_idx += 1
+        n_cols = table.Columns.Count
+        for c in range(current_data_cols + 2, n_cols):
+            try:
+                new_header_cell = table.Cell(1, c)
+                new_header_cell.Range.Font.Bold = ref_header_cell.Range.Font.Bold
+                new_header_cell.Range.Font.Color = ref_header_cell.Range.Font.Color
+                new_header_cell.Range.Font.Size = ref_header_cell.Range.Font.Size
+                new_header_cell.Shading.Texture = ref_header_cell.Shading.Texture
+                new_header_cell.Shading.BackgroundPatternColor = ref_header_cell.Shading.BackgroundPatternColor
+            except Exception:
+                pass
+    else:
+        # Deletes the excess data columns immediately to the left of 합계
+        # (the last column), one at a time -- leaving 구분 (col 1) and
+        # 합계 (the last column) untouched throughout.
+        remove_count = -extra
+        total_col_idx = table.Columns.Count
+        for _ in range(remove_count):
+            table.Columns(total_col_idx - 1).Delete()
+            total_col_idx -= 1
 
     n_cols = table.Columns.Count
-    for c in range(current_data_cols + 2, n_cols):
-        try:
-            new_header_cell = table.Cell(1, c)
-            new_header_cell.Range.Font.Bold = ref_header_cell.Range.Font.Bold
-            new_header_cell.Range.Font.Color = ref_header_cell.Range.Font.Color
-            new_header_cell.Range.Font.Size = ref_header_cell.Range.Font.Size
-            new_header_cell.Shading.Texture = ref_header_cell.Shading.Texture
-            new_header_cell.Shading.BackgroundPatternColor = ref_header_cell.Shading.BackgroundPatternColor
-        except Exception:
-            pass
-
     label_width = original_total_width * 0.14
     total_col_width = original_total_width * 0.12
     data_width = (original_total_width - label_width - total_col_width) / n_groups
@@ -713,7 +729,8 @@ def _pool_composition_label(overall_summary_df: pd.DataFrame, pool: str) -> str:
 def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = None,
                              flush_left: bool = False, bold: Optional[bool] = None,
                              italic: Optional[bool] = None, underline: Optional[bool] = None,
-                             keep_with_next: bool = False) -> None:
+                             keep_with_next: bool = False, page_break_before: bool = False,
+                             insert_blank_after: bool = False) -> None:
     """Setting Range.Text on a Paragraph object leaves that same object
     pointing at the wrong (now-empty, differently-formatted) range
     afterward -- confirmed by testing: re-reading paragraph.Range.Text right
@@ -737,7 +754,20 @@ def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = No
     object -- setting it on the caller's object was confirmed by testing
     to silently no-op (the property read back False on the saved document)
     for exactly the same staleness reason the rest of this docstring
-    already covers for Range.Text/alignment."""
+    already covers for Range.Text/alignment.
+
+    page_break_before=True forces this paragraph to always start a fresh
+    page (used for 담보물 종류별/지역별 분류's pool headings, one pool per
+    page, from the 2nd pool of that section onward).
+
+    insert_blank_after=True inserts a single blank paragraph immediately
+    after this one's own paragraph mark (position computed directly, no
+    later re-query) -- used to put a visible one-line gap between a pool's
+    heading and its own narrative sentence below it. Safe to insert here
+    despite the table-boundary staleness issues documented at length
+    elsewhere in this file: this position is a plain body paragraph
+    boundary, nowhere near a table, which is what all of those issues were
+    actually specific to."""
     if flush_left:
         text = " " + text
     start = paragraph.Range.Start
@@ -754,6 +784,8 @@ def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = No
     if keep_with_next:
         rng.Paragraphs(1).Format.KeepTogether = True
         rng.Paragraphs(1).Format.KeepWithNext = True
+    if page_break_before:
+        rng.Paragraphs(1).Format.PageBreakBefore = True
     if flush_left:
         # This template's paragraphs use CJK "character unit" indentation
         # (CharacterUnitFirstLineIndent=6, i.e. a 6-character first-line
@@ -768,6 +800,9 @@ def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = No
         fresh_para.Format.LeftIndent = 0
         fresh_para.Format.RightIndent = 0
         fresh_para.Format.FirstLineIndent = 0
+    if insert_blank_after:
+        end_pos = start + len(text) + 1
+        doc.Range(end_pos, end_pos).InsertParagraphAfter()
 
 
 # ---------------------------------------------------------------------------
@@ -892,9 +927,14 @@ def _rows_group_breakdown(pool_table: pd.DataFrame, label_key: str):
     The group-rollup columns (5-7) are populated only on each group's first
     row; the group's own name is written as "(그룹명)" into column 7 (유사
     유형구성비), right-aligned, on the row directly below that first row --
-    or, for a single-member group, on an extra row inserted just for the
-    label. A divider line separates each group's block from the next. Every
-    row belonging to one of the top-2 groups by share is highlighted."""
+    or, for a single-member group, on that SAME (only) row, rather than an
+    extra row inserted just to carry the label: an extra, otherwise-blank
+    row for a one-member group reads as a formatting glitch (a near-empty
+    row sandwiched between real data) more than as an intentional label,
+    so it's dropped in favor of just treating that single row as any other
+    data row. A divider line separates each group's block from the next.
+    Every row belonging to one of the top-2 groups by share is
+    highlighted."""
     rows: List[RowSpec] = []
     data = pool_table[pool_table["row_kind"] == "data"]
     top_groups = _top_groups(pool_table, 2)
@@ -920,10 +960,9 @@ def _rows_group_breakdown(pool_table: pd.DataFrame, label_key: str):
 
         if len(items) >= 2:
             rows[block_start + 1].cells[6] = R(f"({group_name})")
-            block_last = rows[-1]  # the block's true last row, not the label row
         else:
-            block_last = RowSpec([L(""), R(""), R(""), R(""), R(""), R(""), R(f"({group_name})")], highlight=hl)
-            rows.append(block_last)
+            rows[block_start].cells[6] = R(f"({group_name})")
+        block_last = rows[-1]  # the block's true last row, not necessarily the label row
 
         if block_idx < len(blocks) - 1:
             block_last.border_bottom = True
@@ -931,7 +970,7 @@ def _rows_group_breakdown(pool_table: pd.DataFrame, label_key: str):
     total = pool_table[pool_table["row_kind"] == "total"].iloc[0]
     rows.append(RowSpec([
         L("합계", True), R(_n(total["count"]), True), R(_n(total["opb_million"]), True), R("100.00%", True),
-        R("", True), R("", True), R("", True),
+        R(_n(total["count"]), True), R(_n(total["opb_million"]), True), R("100.00%", True),
     ], border_top=True, border_bottom=True))
     return rows, top_groups
 
@@ -1139,12 +1178,26 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
             # unit: if the whole block doesn't fit in the remaining space on
             # the current page, Word pushes the ENTIRE block onto a fresh
             # page rather than splitting a pool's intro from its own table.
-            for group in heading_groups:
-                for para, pool in zip(group, pools):
+            # flush_left=True keeps every pool's heading flush against the
+            # left margin with a one-space gap -- without it, a NEWLY
+            # inserted pool's heading (e.g. Pool D) inherits whatever
+            # indent its cloned paragraph happened to carry and visibly
+            # sits off the left margin compared to the template's own
+            # pool headings. insert_blank_after=True puts one blank line
+            # between the heading and its own narrative sentence below it.
+            # page_break_before=True, for 담보물종류별(index 1)/지역별
+            # (index 2) only and only from the 2nd pool onward, makes each
+            # of those two sections literally one pool per page -- the
+            # first pool needs no forced break since it already starts
+            # wherever the section's own intro naturally lands.
+            for section_idx, group in enumerate(heading_groups):
+                for pool_idx, (para, pool) in enumerate(zip(group, pools)):
                     label = _pool_composition_label(t["overall_summary"], pool)
                     heading_text = f"Pool {pool} ({label})" if label else f"Pool {pool}"
+                    page_break = section_idx in (1, 2) and pool_idx > 0
                     _replace_paragraph_text(doc, para, heading_text, bold=True, italic=True, underline=True,
-                                             keep_with_next=True)
+                                             keep_with_next=True, align=WD_ALIGN_LEFT, flush_left=True,
+                                             page_break_before=page_break, insert_blank_after=True)
 
             if anchors["overall"]:
                 _replace_paragraph_text(doc, anchors["overall"][0],

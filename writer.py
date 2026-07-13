@@ -736,18 +736,24 @@ def _section_region(ws: Worksheet, row: int, agg_table: pd.DataFrame, ctx: Sheet
 def _section_matrix(ws: Worksheet, row: int, matrix_df: pd.DataFrame, ctx: SheetContext) -> int:
     """(*) 지역별/물건별 OPB 비중 -- kept as computed values (a % of a % of a
     ratio isn't worth a fragile nested SUMPRODUCT formula); still fully
-    derived from the same helper columns as the tables above."""
+    derived from the same helper columns as the tables above.
+
+    Each pool's own columns are ordered by that pool's OWN composition
+    ratio (summed across every region row), descending -- not one shared
+    order across all pools, since which property type dominates can
+    differ pool to pool."""
     if matrix_df.empty:
         return row
-    prop_groups = [c for c in matrix_df.columns if c not in ("pool_type", "region_group")]
+    all_prop_groups = [c for c in matrix_df.columns if c not in ("pool_type", "region_group")]
     for pool in matrix_df["pool_type"].unique():
+        pool_df = matrix_df[matrix_df["pool_type"] == pool]
+        prop_groups = sorted(all_prop_groups, key=lambda pg: -pool_df[pg].sum())
         cell = ws.cell(row=row, column=SC(1), value=f"Pool {pool} (*) 지역별/물건별 OPB 비중")
         cell.font = POOL_FONT
         cell.fill = POOL_FILL
         ws.merge_cells(start_row=row, start_column=SC(1), end_row=row, end_column=SC(len(prop_groups) + 1))
         row += 1
         row = _table_header(ws, row, ["구분"] + prop_groups)
-        pool_df = matrix_df[matrix_df["pool_type"] == pool]
         for _, data_row in pool_df.iterrows():
             ws.cell(row=row, column=SC(1), value=data_row["region_group"]).font = DATA_FONT
             for i, pg in enumerate(prop_groups, start=2):
