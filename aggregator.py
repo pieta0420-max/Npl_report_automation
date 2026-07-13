@@ -336,10 +336,12 @@ def table_rehab(borrower_df: pd.DataFrame, rehab_df: pd.DataFrame) -> pd.DataFra
     rows = []
     if rehab_df.empty:
         return pd.DataFrame(rows)
-    merged = rehab_df.merge(
-        borrower_df[["borrower_control_no", "opb_incl_prepaid", "claim_total"]],
-        on="borrower_control_no", how="left",
-    )
+    # borrower_control_no is only unique WITHIN a pool -- merging on it alone
+    # would let a Pool B borrower pick up a same-numbered Pool A borrower's
+    # opb/claim once multiple DDs are combined, so both are joined here.
+    key_cols = ["pool_type", "borrower_control_no"]
+    borrower_lookup = borrower_df.drop_duplicates(key_cols)[key_cols + ["opb_incl_prepaid", "claim_total"]]
+    merged = rehab_df.merge(borrower_lookup, on=key_cols, how="left")
     for pool in sorted(x for x in merged["pool_type"].dropna().unique()):
         pool_df = merged[merged["pool_type"] == pool]
         pool_n = len(pool_df)
@@ -370,7 +372,6 @@ def table_rehab(borrower_df: pd.DataFrame, rehab_df: pd.DataFrame) -> pd.DataFra
 
 def table_guarantee(borrower_df: pd.DataFrame, guarantee_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    guaranteed_borrowers = set(guarantee_df["borrower_control_no"].dropna().unique())
     # MCI-classified guarantees (guarantor name contains "MCI") don't count
     # toward the 신용보증서 유효잔액 total -- confirmed with user 2026-07-10.
     is_mci = guarantee_df["guarantor"].fillna("").str.contains("MCI", case=False)
@@ -378,7 +379,12 @@ def table_guarantee(borrower_df: pd.DataFrame, guarantee_df: pd.DataFrame) -> pd
     for pool in _pool_list(borrower_df):
         pool_df = borrower_df[borrower_df["pool_type"] == pool]
         total_opb = pool_df["opb_incl_prepaid"].sum()
-        guaranteed_pool_df = pool_df[pool_df["borrower_control_no"].isin(guaranteed_borrowers)]
+        # borrower_control_no is only unique WITHIN a pool, so the guaranteed
+        # set is scoped to this pool's own guarantee rows before matching --
+        # otherwise a Pool B borrower could falsely match a same-numbered
+        # Pool A borrower's guarantee once multiple DDs are combined.
+        guaranteed_in_pool = set(guarantee_df.loc[guarantee_df["pool_type"] == pool, "borrower_control_no"].dropna())
+        guaranteed_pool_df = pool_df[pool_df["borrower_control_no"].isin(guaranteed_in_pool)]
         target_n = len(guaranteed_pool_df)
         target_opb = guaranteed_pool_df["opb_incl_prepaid"].sum()
         pool_guarantee_balance = balance_eligible[balance_eligible["pool_type"] == pool]["guarantee_balance_converted"].sum()

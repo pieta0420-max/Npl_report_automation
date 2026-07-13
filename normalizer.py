@@ -80,24 +80,38 @@ def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def allocate_collateral_amounts(collateral_df: pd.DataFrame, borrower_df: pd.DataFrame) -> pd.DataFrame:
-    """Fill in Sheet C-1's derived `opb` / `claim_amount` columns."""
+    """Fill in Sheet C-1's derived `opb` / `claim_amount` columns.
+
+    borrower_control_no is only unique WITHIN a pool -- once multiple Data
+    Disk files (one per pool) are combined, the same control number can be
+    reused by an unrelated borrower in a different pool. Joining on
+    borrower_control_no alone then makes borrower_lookup's index non-unique,
+    which crashes with "cannot reindex on an axis with duplicate labels" (or
+    worse, silently mismatches borrowers across pools). Every lookup here is
+    therefore keyed on (pool_type, borrower_control_no) together."""
     if collateral_df.empty:
         collateral_df["opb"] = pd.Series(dtype=float)
         collateral_df["claim_amount"] = pd.Series(dtype=float)
         return collateral_df
 
-    appraisal_sum = collateral_df.groupby("borrower_control_no")["appraisal_amount_total"].transform("sum")
-    count_per_borrower = collateral_df.groupby("borrower_control_no")["borrower_control_no"].transform("count")
+    key_cols = ["pool_type", "borrower_control_no"]
+
+    appraisal_sum = collateral_df.groupby(key_cols)["appraisal_amount_total"].transform("sum")
+    count_per_borrower = collateral_df.groupby(key_cols)["borrower_control_no"].transform("count")
 
     ratio = collateral_df["appraisal_amount_total"] / appraisal_sum
     # if a borrower's properties have no appraisal amount at all, split evenly
     ratio = ratio.where(appraisal_sum.fillna(0) > 0, 1.0 / count_per_borrower)
 
-    borrower_lookup = borrower_df.set_index("borrower_control_no")[["opb_incl_prepaid", "claim_total"]]
-    joined = collateral_df.join(borrower_lookup, on="borrower_control_no", rsuffix="_borrower")
+    # drop_duplicates as a defensive backstop against messy source data (a
+    # genuine duplicate borrower row within one pool); merge() -- unlike
+    # join() -- can't crash on a non-unique key, but a duplicate would still
+    # silently double-count via row expansion without this.
+    borrower_lookup = borrower_df.drop_duplicates(key_cols)[key_cols + ["opb_incl_prepaid", "claim_total"]]
+    joined = collateral_df.merge(borrower_lookup, on=key_cols, how="left")
 
-    collateral_df["opb"] = joined["opb_incl_prepaid"] * ratio
-    collateral_df["claim_amount"] = joined["claim_total"] * ratio
+    collateral_df["opb"] = joined["opb_incl_prepaid"].to_numpy() * ratio.to_numpy()
+    collateral_df["claim_amount"] = joined["claim_total"].to_numpy() * ratio.to_numpy()
     return collateral_df
 
 

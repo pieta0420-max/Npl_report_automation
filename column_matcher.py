@@ -7,6 +7,7 @@ matching so we're comparing against whichever language actually matches.
 """
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -25,11 +26,20 @@ class ColumnMatch:
 
 
 def looks_like_data_row(row: List[object]) -> bool:
+    """A row counts as data as soon as it has ANY numeric- or date-typed
+    cell -- header/label rows are text-only, so even one real number or
+    date is a strong signal. A proportional threshold (e.g. "half the
+    cells") turned out to be fragile: which borrower happens to land in the
+    first data row can shift the text/number mix a lot (e.g. one borrower
+    with a long rehab case-number remark and multiple related-borrower IDs
+    pushed a genuine data row's numeric share as low as 43%), so a ratio-
+    based cutoff would misclassify some pools' first data row as a second
+    header row and pull real values (account numbers, amounts, addresses)
+    into what's supposed to be header text for matching."""
     non_empty = [c for c in row if c is not None and str(c).strip() != ""]
     if not non_empty:
         return False
-    numeric = sum(1 for c in non_empty if isinstance(c, (int, float)))
-    return numeric / len(non_empty) > 0.5
+    return any(isinstance(c, (int, float, datetime.date, datetime.datetime)) for c in non_empty)
 
 
 def get_header_texts(grid: List[List[object]], header_row_index: int) -> List[str]:
@@ -63,7 +73,8 @@ def match_columns(header_texts: List[str], schema: SheetSchema) -> List[ColumnMa
         if not text:
             continue
         for col in matchable_cols:
-            score = max(similarity(text, col.header_kr), similarity(text, col.header_en))
+            candidates = (col.header_kr, col.header_en) + col.aliases
+            score = max(similarity(text, c) for c in candidates)
             if score >= MATCH_THRESHOLD:
                 pairs.append((score, si, col.key))
     pairs.sort(key=lambda p: p[0], reverse=True)

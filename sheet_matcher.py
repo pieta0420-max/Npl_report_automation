@@ -5,8 +5,15 @@ which row within that tab is the header row.
 Detection is a weighted blend of:
   - title keyword overlap (the sheet's descriptive title, usually printed a
     few rows above the header, e.g. "차주일반정보 (Borrower Information)")
-  - header token overlap (Jaccard similarity between the header row's words
-    and the canonical schema's header words)
+  - header column coverage: how many canonical schema columns actually get a
+    confident fuzzy match against this sheet's header row, via the same
+    column_matcher.py logic used for the real column-mapping step. This is
+    deliberately NOT a symmetric word-overlap (Jaccard) measure -- some
+    banks' Data Disk sheets carry many extra columns our schema doesn't
+    define at all (e.g. a collateral sheet with 70+ columns of foreclosure/
+    lien sub-detail beyond our ~35-column canonical schema), and Jaccard
+    penalizes that "superset" shape as harshly as an actual wrong-type
+    sheet, even when every canonical column is matched. Coverage isn't.
 
 Anything below CONFIDENCE_THRESHOLD is left for the user to confirm/assign
 in the GUI rather than guessed silently.
@@ -16,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from column_matcher import get_header_texts, match_columns
 from schema import CANONICAL_SCHEMAS, SheetSchema
 from text_utils import normalize, similarity
 
@@ -53,32 +61,16 @@ def _title_blob(grid: List[List[object]]) -> str:
     return normalize(" ".join(parts))
 
 
-def _header_tokens(grid: List[List[object]], header_row_index: int) -> set:
-    tokens: set = set()
-    for r in (header_row_index, header_row_index + 1):
-        if r >= len(grid):
-            continue
-        for cell in grid[r]:
-            norm = normalize(cell)
-            if norm:
-                tokens.update(norm.split())
-    return tokens
-
-
-def _schema_tokens(schema: SheetSchema) -> set:
-    tokens: set = set()
-    for col in schema.columns:
-        tokens.update(normalize(col.header_kr).split())
-        tokens.update(normalize(col.header_en).split())
-    return tokens
-
-
-def _jaccard(a: set, b: set) -> float:
-    if not a or not b:
+def _header_coverage(grid: List[List[object]], schema: SheetSchema, header_row_index: int) -> float:
+    """Fraction of the schema's own (non-derived) columns that get a
+    confident fuzzy match somewhere in this sheet's header row."""
+    matchable_cols = [c for c in schema.columns if not c.derived]
+    if not matchable_cols:
         return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    return inter / union if union else 0.0
+    header_texts = get_header_texts(grid, header_row_index)
+    matches = match_columns(header_texts, schema)
+    matched_keys = {m.matched_key for m in matches if m.matched_key}
+    return len(matched_keys) / len(matchable_cols)
 
 
 def score_sheet(grid: List[List[object]], schema: SheetSchema, header_row_index: Optional[int]) -> float:
@@ -91,7 +83,7 @@ def score_sheet(grid: List[List[object]], schema: SheetSchema, header_row_index:
 
     header_component = 0.0
     if header_row_index is not None:
-        header_component = _jaccard(_header_tokens(grid, header_row_index), _schema_tokens(schema))
+        header_component = _header_coverage(grid, schema, header_row_index)
 
     return 0.6 * title_component + 0.4 * header_component
 

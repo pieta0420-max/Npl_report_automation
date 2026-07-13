@@ -22,7 +22,7 @@ match a source DD column onto these two keys.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,11 @@ class ColumnDef:
     derived: bool = False  # computed by normalizer, never matched to a source column
     category: str = ""  # top-level merged group header shown above the column, e.g.
                          # "Borrower Identification Information" (cosmetic, mirrors VF layout)
+    # Alternate short labels other banks use for this same field, e.g. "OPB"
+    # for opb_incl_prepaid -- fuzzy string similarity can't bridge a terse
+    # industry abbreviation against our verbose descriptive header_kr/en, so
+    # these are checked as extra exact-ish candidates during column matching.
+    aliases: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -66,7 +71,7 @@ BORROWER = SheetSchema(
         ColumnDef("prepaid_expense", "가지급금 잔액", "Prepaid expense", category="Summary of the Loans to be Sold"),
         ColumnDef("opb_incl_prepaid", "환산된 미상환원금잔액(가지급금 포함)",
                    "Coverted Outstanding Principal Balance including prepaid expense",
-                   category="Summary of the Loans to be Sold"),
+                   category="Summary of the Loans to be Sold", aliases=("OPB", "합계-OPB")),
         ColumnDef("accrued_interest", "미수이자 잔액", "Accrued Interest", category="Summary of the Loans to be Sold"),
         ColumnDef("claim_total", "채권액 합계", "Sum of OPB and Accrued Interest", category="Summary of the Loans to be Sold"),
         ColumnDef("mortgage_amount_converted", "차주별 환산 후 근저당권설정액",

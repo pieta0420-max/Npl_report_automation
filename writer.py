@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from aggregator import AggregationResult
@@ -247,6 +247,20 @@ def _write_helper_column(ws: Worksheet, col_idx: int, header_kr: str, header_en:
     return get_column_letter(col_idx)
 
 
+def _write_borrower_key_column(ws: Worksheet, col_idx: int, col_map: ColumnMap, n_rows: int) -> str:
+    """borrower_control_no is only unique WITHIN a pool -- once multiple
+    Data Disk files (one per pool) are merged into one report, the same
+    control number can be reused by an unrelated borrower in a different
+    pool. Every VLOOKUP/SUMIFS/COUNTIFS that matches borrowers across sheets
+    keys on this composite (pool, control_no) string instead of the raw
+    control number, so a Pool B borrower can never match a Pool A row that
+    happens to share the same number."""
+    pool_col = col_map["pool_type"]
+    key_col = col_map["borrower_control_no"]
+    formulas = [f"={pool_col}{r}&\"|\"&{key_col}{r}" for r in range(9, 9 + n_rows)]
+    return _write_helper_column(ws, col_idx, "차주키(자동계산)", "Borrower Key (auto)", formulas=formulas)
+
+
 def _finalize_sheet(ws: Worksheet, n_cols: int, n_rows: int) -> None:
     for c in range(1, n_cols + 1):
         ws.column_dimensions[get_column_letter(c)].width = 14
@@ -264,6 +278,9 @@ def write_borrower_sheet(wb: Workbook, df: pd.DataFrame, config: dict, program_n
     _write_title_block(ws, schema, program_name)
 
     col_map, next_col = _write_canonical_columns(ws, schema, df)
+
+    col_map["borrower_key"] = _write_borrower_key_column(ws, next_col, col_map, len(df))
+    next_col += 1
 
     bucket_thresholds, bucket_labels = active_amount_buckets(df, config)
     bucket_values = [amount_bucket_label(v, bucket_thresholds, bucket_labels) for v in df["opb_incl_prepaid"]]
@@ -287,11 +304,17 @@ def write_collateral_sheet(wb: Workbook, df: pd.DataFrame, config: dict,
 
     col_map, next_col = _write_canonical_columns(ws, schema, df, skip_keys=("opb", "claim_amount"))
 
+    col_map["borrower_key"] = _write_borrower_key_column(ws, next_col, col_map, len(df))
+    next_col += 1
+
     # opb / claim_amount: proportional allocation as LIVE formulas (mirrors the
-    # exact SUMIFS pattern found in VF.xlsx's own C-1 sheet formulas)
-    key_col = col_map["borrower_control_no"]
+    # exact SUMIFS pattern found in VF.xlsx's own C-1 sheet formulas). Keyed
+    # on the composite borrower_key (not the raw control number, which is
+    # only unique within a pool) so a Pool B borrower's row can never match
+    # a same-numbered Pool A borrower once multiple DDs are merged.
+    key_col = col_map["borrower_key"]
     appraisal_col = col_map["appraisal_amount_total"]
-    b_key_col = borrower_cols["borrower_control_no"]
+    b_key_col = borrower_cols["borrower_key"]
 
     def _alloc_formula(source_col: str) -> List[str]:
         # Proportional split by appraisal amount; if a borrower's properties
@@ -354,12 +377,15 @@ def write_collateral_sheet(wb: Workbook, df: pd.DataFrame, config: dict,
     return sheet_name, col_map
 
 
-def _vlookup_formula(key_cell: str, source_sheet: str, key_col: str, target_col: str) -> str:
-    key_idx = column_index_from_string(key_col)
-    target_idx = column_index_from_string(target_col)
-    offset = target_idx - key_idx + 1
-    rng = f"{_q(source_sheet)}!${key_col}:${target_col}"
-    return f"=IFERROR(VLOOKUP({key_cell},{rng},{offset},FALSE),0)"
+def _lookup_formula(key_cell: str, source_sheet: str, key_col: str, target_col: str) -> str:
+    """INDEX/MATCH rather than VLOOKUP: VLOOKUP requires the target column to
+    sit to the right of the key column within its search range, but the
+    borrower_key helper column (the key used here) is appended after all of
+    borrower sheet's canonical columns -- including opb/claim, which are
+    common lookup targets -- so that ordering constraint doesn't hold."""
+    key_rng = _rng(source_sheet, key_col)
+    target_rng = _rng(source_sheet, target_col)
+    return f"=IFERROR(INDEX({target_rng},MATCH({key_cell},{key_rng},0)),0)"
 
 
 def write_guarantee_sheet(wb: Workbook, df: pd.DataFrame, borrower_sheet: str, borrower_cols: ColumnMap,
@@ -370,15 +396,18 @@ def write_guarantee_sheet(wb: Workbook, df: pd.DataFrame, borrower_sheet: str, b
     _write_title_block(ws, schema, program_name)
 
     col_map, next_col = _write_canonical_columns(ws, schema, df)
-    key_col = col_map["borrower_control_no"]
 
-    opb_formulas = [_vlookup_formula(f"${key_col}{r}", borrower_sheet, borrower_cols["borrower_control_no"],
-                                      borrower_cols["opb_incl_prepaid"]) for r in range(9, 9 + len(df))]
+    col_map["borrower_key"] = _write_borrower_key_column(ws, next_col, col_map, len(df))
+    next_col += 1
+    key_col = col_map["borrower_key"]
+
+    opb_formulas = [_lookup_formula(f"${key_col}{r}", borrower_sheet, borrower_cols["borrower_key"],
+                                     borrower_cols["opb_incl_prepaid"]) for r in range(9, 9 + len(df))]
     col_map["borrower_opb"] = _write_helper_column(
-        ws, next_col, "차주 OPB(자동계산)", "Borrower OPB (auto, VLOOKUP)", formulas=opb_formulas, numfmt=CURRENCY_FMT)
+        ws, next_col, "차주 OPB(자동계산)", "Borrower OPB (auto, INDEX/MATCH)", formulas=opb_formulas, numfmt=CURRENCY_FMT)
     next_col += 1
 
-    # first-occurrence flag per borrower_control_no, so target_borrower_count /
+    # first-occurrence flag per borrower_key, so target_borrower_count /
     # target_opb don't double-count a borrower with >1 guarantee row
     first_formulas = [f"=IF(COUNTIF(${key_col}$9:${key_col}{r},${key_col}{r})=1,1,0)" for r in range(9, 9 + len(df))]
     col_map["is_first"] = _write_helper_column(
@@ -397,18 +426,21 @@ def write_rehab_sheet(wb: Workbook, df: pd.DataFrame, borrower_sheet: str, borro
     _write_title_block(ws, schema, program_name)
 
     col_map, next_col = _write_canonical_columns(ws, schema, df)
-    key_col = col_map["borrower_control_no"]
 
-    opb_formulas = [_vlookup_formula(f"${key_col}{r}", borrower_sheet, borrower_cols["borrower_control_no"],
-                                      borrower_cols["opb_incl_prepaid"]) for r in range(9, 9 + len(df))]
+    col_map["borrower_key"] = _write_borrower_key_column(ws, next_col, col_map, len(df))
+    next_col += 1
+    key_col = col_map["borrower_key"]
+
+    opb_formulas = [_lookup_formula(f"${key_col}{r}", borrower_sheet, borrower_cols["borrower_key"],
+                                     borrower_cols["opb_incl_prepaid"]) for r in range(9, 9 + len(df))]
     col_map["borrower_opb"] = _write_helper_column(
-        ws, next_col, "차주 OPB(자동계산)", "Borrower OPB (auto, VLOOKUP)", formulas=opb_formulas, numfmt=CURRENCY_FMT)
+        ws, next_col, "차주 OPB(자동계산)", "Borrower OPB (auto, INDEX/MATCH)", formulas=opb_formulas, numfmt=CURRENCY_FMT)
     next_col += 1
 
-    claim_formulas = [_vlookup_formula(f"${key_col}{r}", borrower_sheet, borrower_cols["borrower_control_no"],
-                                        borrower_cols["claim_total"]) for r in range(9, 9 + len(df))]
+    claim_formulas = [_lookup_formula(f"${key_col}{r}", borrower_sheet, borrower_cols["borrower_key"],
+                                       borrower_cols["claim_total"]) for r in range(9, 9 + len(df))]
     col_map["borrower_claim"] = _write_helper_column(
-        ws, next_col, "차주 채권총액(자동계산)", "Borrower Claim Total (auto, VLOOKUP)",
+        ws, next_col, "차주 채권총액(자동계산)", "Borrower Claim Total (auto, INDEX/MATCH)",
         formulas=claim_formulas, numfmt=CURRENCY_FMT)
     next_col += 1
 
