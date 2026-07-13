@@ -21,6 +21,7 @@ formatting is set explicitly below instead of relying on inheritance.
 """
 from __future__ import annotations
 
+import re
 import shutil
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -28,6 +29,13 @@ from typing import List, Optional
 import pandas as pd
 
 import narrative
+
+# "Pool A (Special & Regular)" -- the per-pool sub-heading that appears
+# once per pool in each of the 3 per-pool-table sections (금액별 분류 /
+# 담보물 종류별 분석 / 담보물 지역별 분류). Identically shaped across all 3
+# sections and all pools, so it can't be told apart by text content alone
+# -- callers chunk the flat, in-document-order list themselves.
+POOL_HEADING_RE = re.compile(r"^Pool [A-Z] \(")
 
 # Word constants (win32com late-binding doesn't expose the wdXxx names)
 WD_ALIGN_LEFT = 0
@@ -302,27 +310,79 @@ def _unmerge_header_vertical_cells(table, header_rows: int) -> None:
 
 
 def _clone_table(doc, source_index: int, insert_after_index: int) -> None:
-    """Copies the table at source_index (1-based, re-read fresh so this is
-    safe to call repeatedly as indices shift with each insertion) and
-    inserts the duplicate immediately after the table at insert_after_index
-    (may be the same table, or a different one -- used to grow a per-pool
-    table block by cloning the last pool's table(s) onto the end of the
-    section). Pasting a copied table's Range directly against another
-    table's end merges the two into one (confirmed by testing -- row counts
-    added together instead of a new Tables entry appearing); inserting an
-    empty paragraph first, then pasting after THAT, keeps them separate."""
-    import pythoncom
+    """Builds a new table (via Tables.Add, same row/column count as the
+    source at source_index) immediately after the table at
+    insert_after_index (may be the same table, or a different one -- used
+    to grow a per-pool table block by cloning the last pool's table(s)
+    onto the end of the section), then copies every cell's text and basic
+    formatting (font, alignment, shading, borders) from source to the new
+    table one cell at a time. Cells the source table has merged away
+    (Cell(r, c) raising) are skipped on both sides. Column widths are
+    copied separately since Tables.Add doesn't infer them from context.
+    Inserting an empty paragraph before the new table (rather than adding
+    it directly at the source table's end) keeps the two tables from
+    merging into one (confirmed by testing -- row counts added together
+    instead of a new Tables entry appearing).
 
+    Deliberately NOT a Copy()/Paste() of the source table's Range, and NOT
+    a Range.FormattedText assignment either -- both were tried first.
+    Copy()/Paste() intermittently failed with a bare "this command is not
+    available" COM error unrelated to anything this function does
+    (confirmed by testing: the exact same call succeeded earlier in this
+    session, then started failing on every single attempt later with
+    nothing else changed, even across fresh Word.Application instances and
+    with retries/delays added). FormattedText avoids the clipboard but was
+    dramatically slower for a document this size (a run that normally
+    finishes in ~1-2 minutes was still climbing past 10 minutes). Per-cell
+    copying sidesteps both: no clipboard, no whole-range serialization.
+    Any data-row content this copies over is harmless throwaway anyway --
+    _rebuild_table fully replaces every data row afterward and only ever
+    leaves the header row(s) as-is."""
     src = doc.Tables(source_index)
     target = doc.Tables(insert_after_index)
     end = target.Range.End
     gap = doc.Range(end, end)
     gap.InsertParagraphAfter()
     new_pos = end + 1
-    src.Range.Copy()
-    pythoncom.PumpWaitingMessages()
-    doc.Range(new_pos, new_pos).Paste()
-    pythoncom.PumpWaitingMessages()
+
+    n_rows = src.Rows.Count
+    n_cols = src.Columns.Count
+    new_table = doc.Tables.Add(doc.Range(new_pos, new_pos), n_rows, n_cols)
+
+    for c in range(1, n_cols + 1):
+        try:
+            new_table.Columns(c).Width = src.Columns(c).Width
+        except Exception:
+            pass
+
+    for r in range(1, n_rows + 1):
+        for c in range(1, n_cols + 1):
+            try:
+                src_cell = src.Cell(r, c)
+            except Exception:
+                continue
+            try:
+                dst_cell = new_table.Cell(r, c)
+            except Exception:
+                continue
+            dst_cell.Range.Text = _cell_text(src_cell)
+            dst_cell.Range.Font.Bold = src_cell.Range.Font.Bold
+            dst_cell.Range.Font.Size = src_cell.Range.Font.Size
+            dst_cell.Range.Font.Name = src_cell.Range.Font.Name
+            try:
+                dst_cell.Range.ParagraphFormat.Alignment = src_cell.Range.ParagraphFormat.Alignment
+            except Exception:
+                pass
+            try:
+                dst_cell.Shading.Texture = src_cell.Shading.Texture
+                dst_cell.Shading.BackgroundPatternColor = src_cell.Shading.BackgroundPatternColor
+            except Exception:
+                pass
+            try:
+                dst_cell.Borders(WD_BORDER_TOP).LineStyle = src_cell.Borders(WD_BORDER_TOP).LineStyle
+                dst_cell.Borders(WD_BORDER_BOTTOM).LineStyle = src_cell.Borders(WD_BORDER_BOTTOM).LineStyle
+            except Exception:
+                pass
 
 
 def _rewrite_matrix_header(table, prop_groups: List[str]) -> None:
@@ -339,27 +399,90 @@ def _rewrite_matrix_header(table, prop_groups: List[str]) -> None:
         table.Cell(1, i + 1).Range.Text = headers[i]
 
 
-def _clone_paragraph_after(doc, paragraph):
-    """Duplicates a narrative paragraph (with its formatting) and inserts
-    the copy immediately after it -- used when the template has fewer
-    instances of a given narrative sentence than the deal has pools (e.g.
-    a template built for 3 pools has no 4th "Pool D" sentence slot at
-    all). Returns the newly created Paragraph object."""
-    import pythoncom
+def _insert_pool_intro_before_table(doc, tables, table_index: int, heading_source, narrative_source, narrative_category: str):
+    """Inserts two new blank paragraphs -- a heading placeholder and a
+    narrative placeholder -- immediately before the table at table_index,
+    styled to match heading_source/narrative_source (the corresponding
+    paragraphs from an existing pool's own section). Each pool's
+    heading+narrative sits directly above that pool's OWN table, not
+    clustered with the other pools' headings/narratives elsewhere in the
+    document (confirmed by reading the template's actual paragraph order)
+    -- so the insertion point has to be anchored to that specific table.
 
-    end = paragraph.Range.End
-    paragraph.Range.Copy()
-    pythoncom.PumpWaitingMessages()
-    doc.Range(end, end).Paste()
-    pythoncom.PumpWaitingMessages()
-    return doc.Range(end, end + 1).Paragraphs(1)
+    Callers (build_word_report) immediately overwrite both placeholders'
+    text via _replace_paragraph_text once every pool's real heading label
+    and narrative sentence is computed -- so this function only needs to
+    get two correctly-FORMATTED empty paragraphs into the right place, not
+    clone any actual text. That sidesteps an entire class of problems the
+    clipboard-based approach ran into (see git history for the earlier,
+    much longer version of this docstring): Table.Range.Start reading back
+    stale post-paste, a collapsed Range().Paste() landing INSIDE the
+    table's first cell instead of before the table when its position sits
+    exactly on the table boundary, Range.FormattedText assignment being
+    dramatically slower than Copy/Paste for a document this size, and
+    finally Copy()/Paste() itself starting to fail deterministically with
+    a bare "this command is not available" COM error partway through this
+    session with no clear trigger (confirmed by testing: retries, delays,
+    and a completely clipboard-free FormattedText alternative all still
+    hit it or its slowness).
 
+    table.Range.InsertParagraphBefore() turned out to have the exact same
+    table-boundary ambiguity as the Paste() approach did -- confirmed by
+    testing (twice, including after switching to doc.Paragraphs.Add(range),
+    which MSDN documents as inserting a paragraph "before" a range but
+    which, tested against this exact table boundary, produced byte-for-
+    byte the same result): the "new" paragraphs both approaches created
+    were reported in_table=True, landing inside the table's own Cell(1,1)
+    rather than in the body before it.
 
-def _ensure_anchor_count(doc, anchors: list, target_count: int) -> None:
-    """Extends an anchors list (from _collect_narrative_anchors) up to
-    target_count by cloning its last entry, once per missing pool."""
-    while anchors and len(anchors) < target_count:
-        anchors.append(_clone_paragraph_after(doc, anchors[-1]))
+    table_index is always a table _clone_table just created (this function
+    is only ever called for the newly-extended pool slots), immediately
+    after the table at table_index - 1 (true for every call site: within
+    a block, consecutive pool slots are consecutive table indices, and
+    across a block boundary -- e.g. region's data table cloned in right
+    after the previous pool's MATRIX table, not its own data table --
+    table_index - 1 is still whatever _clone_table's insert_after_index
+    was, by construction). Splitting the ALREADY-existing blank separator
+    paragraph's own text in place (an earlier version of this function)
+    turned out unsafe too -- confirmed by testing: it merged table_index-1
+    and table_index into a single table (row counts added together, total
+    Tables.Count dropping by one), the same failure mode _clone_table's
+    own docstring warns about for a bare Copy/Paste against a table's end.
+    Only a PLAIN InsertParagraphAfter() on the PRECEDING table's Range.End
+    has been reliable all session for adding body content next to a table
+    boundary (it's the exact mechanism _clone_table itself relies on to
+    keep cloned tables from merging into their neighbor) -- so this reuses
+    that primitive directly instead of touching the existing separator.
+
+    Reusing the pre-existing separator paragraph for the narrative slot
+    (rather than inserting a second fresh one) turned out unsafe too --
+    confirmed by testing: the heading landed correctly in the body, but
+    the narrative that was supposed to reuse the old separator ended up
+    inside the table's own Cell(1,1) instead. Inserting BOTH paragraphs
+    explicitly via the same InsertParagraphAfter() primitive (leaving the
+    original separator as a harmless extra blank line before the table,
+    rather than trying to repurpose it) is what's actually reliable."""
+    preceding_table = tables(table_index - 1)
+    end = preceding_table.Range.End
+    doc.Range(end, end).InsertParagraphAfter()
+    new_heading = doc.Range(end, end).Paragraphs(1)
+    heading_end = end + 1
+    doc.Range(heading_end, heading_end).InsertParagraphAfter()
+    new_narrative = doc.Range(heading_end, heading_end).Paragraphs(1)
+
+    for src, dst in ((heading_source, new_heading), (narrative_source, new_narrative)):
+        dst.Range.Font.Bold = src.Range.Font.Bold
+        dst.Range.Font.Size = src.Range.Font.Size
+        dst.Range.Font.Name = src.Range.Font.Name
+        dst.Range.ParagraphFormat.Alignment = src.Range.ParagraphFormat.Alignment
+        try:
+            dst.Format.LeftIndent = src.Format.LeftIndent
+            dst.Format.FirstLineIndent = src.Format.FirstLineIndent
+            dst.Format.CharacterUnitFirstLineIndent = src.Format.CharacterUnitFirstLineIndent
+        except Exception:
+            pass
+
+    return new_heading, new_narrative
 
 
 def _extend_pool_table_block(doc, first_index: int, block_size: int,
@@ -383,6 +506,24 @@ def _extend_pool_table_block(doc, first_index: int, block_size: int,
         last_index = insert_after
 
 
+def _narrative_category(text: str) -> Optional[str]:
+    """Which of the 4 intro-sentence kinds `text` matches, by its own
+    distinctive wording, or None. Shared by _collect_narrative_anchors
+    (the initial pass over the whole document) and the pool-intro cloning
+    logic (which re-applies the same matching to a small pasted region, to
+    reliably re-identify the cloned narrative paragraph by content rather
+    than by position)."""
+    if "매각 Program은 총" in text:
+        return "overall"
+    if "차주가 전체 OPB의" in text and "이상" in text:
+        return "amount"
+    if "가장 많은 비중을 차지" in text:
+        return "proptype"
+    if "소재 물건이" in text and "차지하고 있습니다" in text:
+        return "region"
+    return None
+
+
 def _collect_narrative_anchors(doc, stop_before_table) -> dict:
     """One pass over the paragraphs in pages 1-9 (up to stop_before_table's
     start), bucketing the 4 kinds of intro sentence by a distinctive keyword
@@ -394,7 +535,7 @@ def _collect_narrative_anchors(doc, stop_before_table) -> dict:
     cell instead, merging the sentence text into it. Matching by the
     sentence's own distinctive wording sidesteps that boundary ambiguity
     entirely."""
-    anchors = {"overall": [], "amount": [], "proptype": [], "region": []}
+    anchors = {"overall": [], "amount": [], "proptype": [], "region": [], "pool_heading": []}
     limit = stop_before_table.Range.Start
     for p in doc.Paragraphs:
         if p.Range.Start >= limit:
@@ -402,15 +543,29 @@ def _collect_narrative_anchors(doc, stop_before_table) -> dict:
         text = p.Range.Text.strip()
         if not text:
             continue
-        if "매각 Program은 총" in text:
-            anchors["overall"].append(p)
-        elif "차주가 전체 OPB의" in text and "이상" in text:
-            anchors["amount"].append(p)
-        elif "가장 많은 비중을 차지" in text:
-            anchors["proptype"].append(p)
-        elif "소재 물건이" in text and "차지하고 있습니다" in text:
-            anchors["region"].append(p)
+        if POOL_HEADING_RE.match(text):
+            anchors["pool_heading"].append(p)
+        category = _narrative_category(text)
+        if category:
+            anchors[category].append(p)
     return anchors
+
+
+def _pool_composition_label(overall_summary_df: pd.DataFrame, pool: str) -> str:
+    """"Pool A (Special & Regular)" / "(Regular)" / "(Special)" -- whichever
+    of the two asset types this pool's borrowers actually have."""
+    pool_rows = overall_summary_df[
+        (overall_summary_df["pool_type"] == pool) & (overall_summary_df["row_kind"] == "data")
+    ]
+    has_regular = ((pool_rows["category"] == "일반담보부") & (pool_rows["count"] > 0)).any()
+    has_special = ((pool_rows["category"] == "특별담보부") & (pool_rows["count"] > 0)).any()
+    if has_regular and has_special:
+        return "Special & Regular"
+    if has_special:
+        return "Special"
+    if has_regular:
+        return "Regular"
+    return ""
 
 
 def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = None,
@@ -760,14 +915,51 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
             rehab_idx = 4 + 4 * n_pools
             guarantee_idx = 5 + 4 * n_pools
 
-            # --- collect all 4 kinds of intro sentence in one pass, THEN
-            # rewrite them (left-aligned), before touching any table ---
+            # --- collect all 4 kinds of intro sentence + the "Pool X (...)"
+            # sub-heading in one pass, THEN extend/rewrite them, before
+            # touching any table's own content ---
             anchors = _collect_narrative_anchors(doc, tables(foreclosure_idx))
+
+            # "Pool X (Special & Regular)" sub-headings are identically
+            # shaped across all 3 per-pool-table sections (금액별/담보물
+            # 종류별/담보물지역별), so there's no keyword to tell them
+            # apart by -- chunk the flat, in-document-order list into 3
+            # equal groups (by the template's ORIGINAL pool count) first.
+            headings = anchors["pool_heading"]
+            heading_groups = (
+                [headings[i * template_pools:(i + 1) * template_pools] for i in range(3)]
+                if len(headings) == 3 * template_pools else [[], [], []]
+            )
+
             # template built for fewer pools than this deal has -> no Nth
-            # narrative sentence slot exists yet for the extra pool(s)
-            _ensure_anchor_count(doc, anchors["amount"], n_pools)
-            _ensure_anchor_count(doc, anchors["proptype"], n_pools)
-            _ensure_anchor_count(doc, anchors["region"], n_pools)
+            # heading/narrative slot exists yet for the extra pool(s).
+            # Both are inserted immediately before that pool's own
+            # (already correctly positioned, via the table extension
+            # above) table -- each pool's heading+narrative sits directly
+            # above that pool's OWN table, not clustered with the other
+            # pools' headings/narratives, so the insertion point has to be
+            # anchored to that specific table.
+            for h_group, n_list, table_indices, category in (
+                (heading_groups[0], anchors["amount"], amount_indices, "amount"),
+                (heading_groups[1], anchors["proptype"], proptype_indices, "proptype"),
+                (heading_groups[2], anchors["region"], region_data_indices, "region"),
+            ):
+                for pool_idx in range(template_pools, n_pools):
+                    if not h_group or not n_list:
+                        break
+                    new_h, new_n = _insert_pool_intro_before_table(
+                        doc, tables, table_indices[pool_idx], h_group[-1], n_list[-1], category)
+                    if new_h is None or new_n is None:
+                        break
+                    h_group.append(new_h)
+                    n_list.append(new_n)
+
+            for group in heading_groups:
+                for para, pool in zip(group, pools):
+                    label = _pool_composition_label(t["overall_summary"], pool)
+                    heading_text = f"Pool {pool} ({label})" if label else f"Pool {pool}"
+                    _replace_paragraph_text(doc, para, heading_text)
+
             if anchors["overall"]:
                 _replace_paragraph_text(doc, anchors["overall"][0],
                                          narrative.overall_summary_sentence(bank_name, borrower_df),
@@ -822,13 +1014,25 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
                 _set_row_height(tables(table_idx), GROUP_TABLE_ROW_HEIGHT_CM)
 
             # --- 2.4/2.5/2.6: 경매/회생/신용보증서 (no narrative) ---
+            # Any vertical merge ANYWHERE in a table blocks Rows.Delete() on
+            # EVERY row of that table, not just the merged one (confirmed
+            # earlier this session for 신용보증서's 2-row merged header) --
+            # so _detect_header_rows/_unmerge_header_vertical_cells is
+            # applied defensively to all 3 of these Pool-per-row tables, not
+            # just whichever one happened to be hit by it first.
+            foreclosure_table = tables(foreclosure_idx)
+            foreclosure_header_rows = _detect_header_rows(foreclosure_table, pools)
+            _unmerge_header_vertical_cells(foreclosure_table, foreclosure_header_rows)
             rows11, dividers11 = _rows_foreclosure(t["foreclosure"])
-            _rebuild_table(tables(foreclosure_idx), rows11, skip_highlight_cols={1})
-            _set_pool_column_dividers(tables(foreclosure_idx), dividers11, close_bottom=True)
+            _rebuild_table(foreclosure_table, rows11, header_rows=foreclosure_header_rows, skip_highlight_cols={1})
+            _set_pool_column_dividers(foreclosure_table, dividers11, header_rows=foreclosure_header_rows, close_bottom=True)
 
+            rehab_table = tables(rehab_idx)
+            rehab_header_rows = _detect_header_rows(rehab_table, pools)
+            _unmerge_header_vertical_cells(rehab_table, rehab_header_rows)
             rows12, dividers12 = _rows_rehab(t["rehab"])
-            _rebuild_table(tables(rehab_idx), rows12, skip_highlight_cols={1})
-            _set_pool_column_dividers(tables(rehab_idx), dividers12, close_bottom=True)
+            _rebuild_table(rehab_table, rows12, header_rows=rehab_header_rows, skip_highlight_cols={1})
+            _set_pool_column_dividers(rehab_table, dividers12, header_rows=rehab_header_rows, close_bottom=True)
 
             guarantee_table = tables(guarantee_idx)
             guarantee_header_rows = _detect_header_rows(guarantee_table, pools)
