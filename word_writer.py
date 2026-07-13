@@ -42,13 +42,17 @@ WD_ALIGN_LEFT = 0
 WD_ALIGN_CENTER = 1
 WD_ALIGN_RIGHT = 2
 WD_BORDER_TOP = -1
+WD_BORDER_LEFT = -2
 WD_BORDER_BOTTOM = -3
+WD_BORDER_RIGHT = -4
 WD_LINE_STYLE_NONE = 0
 WD_LINE_STYLE_SINGLE = 1
 WD_COLOR_BLACK = 0
 WD_COLOR_AUTOMATIC = -16777216
 WD_TEXTURE_NONE = 0
 WD_LIST_NO_NUMBERING = 0
+WD_UNDERLINE_NONE = 0
+WD_UNDERLINE_SINGLE = 1
 
 # #DAEEF3 (a light blue), converted to Word's BGR long-color format.
 _HL_R, _HL_G, _HL_B = 0xDA, 0xEE, 0xF3
@@ -349,6 +353,18 @@ def _clone_table(doc, source_index: int, insert_after_index: int) -> None:
     n_cols = src.Columns.Count
     new_table = doc.Tables.Add(doc.Range(new_pos, new_pos), n_rows, n_cols)
 
+    # Table-level default cell margins (Table Properties > Cell > Default
+    # cell margins) aren't a per-cell property Tables.Add() infers from
+    # context. Hardcoded to 0.1cm rather than copied from the source table:
+    # confirmed by testing that the 담보물지역별 tables' own source padding
+    # is actually 0.175cm (not 0.1cm), so copying it would have carried the
+    # wrong value forward into every cloned pool's table.
+    try:
+        new_table.LeftPadding = 0.1 * CM_TO_PT
+        new_table.RightPadding = 0.1 * CM_TO_PT
+    except Exception:
+        pass
+
     for c in range(1, n_cols + 1):
         try:
             new_table.Columns(c).Width = src.Columns(c).Width
@@ -369,6 +385,12 @@ def _clone_table(doc, source_index: int, insert_after_index: int) -> None:
             dst_cell.Range.Font.Bold = src_cell.Range.Font.Bold
             dst_cell.Range.Font.Size = src_cell.Range.Font.Size
             dst_cell.Range.Font.Name = src_cell.Range.Font.Name
+            # Font.Color (e.g. white text on a dark-shaded header row) isn't
+            # implied by Bold/Size/Name -- without copying it explicitly, a
+            # cloned header row's text silently reverts to Word's default
+            # (black), unreadable against the still-correctly-copied dark
+            # shading below.
+            dst_cell.Range.Font.Color = src_cell.Range.Font.Color
             try:
                 dst_cell.Range.ParagraphFormat.Alignment = src_cell.Range.ParagraphFormat.Alignment
             except Exception:
@@ -381,6 +403,13 @@ def _clone_table(doc, source_index: int, insert_after_index: int) -> None:
             try:
                 dst_cell.Borders(WD_BORDER_TOP).LineStyle = src_cell.Borders(WD_BORDER_TOP).LineStyle
                 dst_cell.Borders(WD_BORDER_BOTTOM).LineStyle = src_cell.Borders(WD_BORDER_BOTTOM).LineStyle
+                # LEFT/RIGHT (column-divider) borders -- e.g. the line
+                # between 구분/차주수 and between 구성비/누적 차주수 in the
+                # 금액별/담보물지역별 tables -- were previously left
+                # uncopied, so a cloned pool's table silently lost every
+                # interior vertical divider the source table had.
+                dst_cell.Borders(WD_BORDER_LEFT).LineStyle = src_cell.Borders(WD_BORDER_LEFT).LineStyle
+                dst_cell.Borders(WD_BORDER_RIGHT).LineStyle = src_cell.Borders(WD_BORDER_RIGHT).LineStyle
             except Exception:
                 pass
 
@@ -397,6 +426,78 @@ def _rewrite_matrix_header(table, prop_groups: List[str]) -> None:
     headers = ["구분"] + list(prop_groups) + ["합계"]
     for i in range(min(len(headers), table.Columns.Count)):
         table.Cell(1, i + 1).Range.Text = headers[i]
+
+
+def _sorted_prop_groups(pool_matrix: pd.DataFrame, prop_groups: List[str]) -> List[str]:
+    """Orders this POOL's own property-type-group columns by that pool's
+    own composition ratio (the column's summed share across every region
+    row), descending -- each pool's matrix table gets its own column order
+    rather than sharing one fixed order across all pools, since which
+    property type dominates can differ pool to pool."""
+    totals = {pg: pool_matrix[pg].sum() for pg in prop_groups}
+    return sorted(prop_groups, key=lambda pg: totals[pg], reverse=True)
+
+
+def _ensure_matrix_columns(table, n_groups: int) -> None:
+    """The (*) 지역별/물건별 OPB 비중 matrix's column count is fixed at
+    whatever the template's property-type-group count happened to be when
+    it was last built for a prior deal -- e.g. this template's Pool B/C
+    matrix tables only have 5 data-column slots (7 total with 구분/합계).
+    If the current deal's classification_config.json defines MORE groups
+    than that (this deal's 6 groups already exceeds it), the header-
+    rewrite would silently overflow into and overwrite the 합계 column
+    with the last group's name, losing the true total column entirely.
+    Inserting the missing columns right before 합계 (so 합계 stays the
+    rightmost column), then rescaling every column's width from the
+    table's original total width, keeps the table the same overall size
+    while making room for the extra group(s)."""
+    current_data_cols = table.Columns.Count - 2  # minus 구분, 합계
+    extra = n_groups - current_data_cols
+    if extra <= 0:
+        return
+    original_total_width = sum(table.Columns(c).Width for c in range(1, table.Columns.Count + 1))
+    ref_header_cell = table.Cell(1, 2)  # an existing data-group header cell, used as the new columns' format template
+    insert_before_idx = table.Columns.Count  # 합계's current position
+    for _ in range(extra):
+        table.Columns.Add(BeforeColumn=table.Columns(insert_before_idx))
+        insert_before_idx += 1
+
+    n_cols = table.Columns.Count
+    for c in range(current_data_cols + 2, n_cols):
+        try:
+            new_header_cell = table.Cell(1, c)
+            new_header_cell.Range.Font.Bold = ref_header_cell.Range.Font.Bold
+            new_header_cell.Range.Font.Color = ref_header_cell.Range.Font.Color
+            new_header_cell.Range.Font.Size = ref_header_cell.Range.Font.Size
+            new_header_cell.Shading.Texture = ref_header_cell.Shading.Texture
+            new_header_cell.Shading.BackgroundPatternColor = ref_header_cell.Shading.BackgroundPatternColor
+        except Exception:
+            pass
+
+    label_width = original_total_width * 0.14
+    total_col_width = original_total_width * 0.12
+    data_width = (original_total_width - label_width - total_col_width) / n_groups
+    table.Columns(1).Width = label_width
+    for c in range(2, n_cols):
+        table.Columns(c).Width = data_width
+    table.Columns(n_cols).Width = total_col_width
+
+
+def _set_vertical_dividers(table, after_cols: List[int]) -> None:
+    """Draws a single vertical line on the RIGHT edge of each column in
+    after_cols (1-indexed), for every row including the header -- used for
+    the interior column dividers (e.g. between 구분/차주수, or on either
+    side of the (*) matrix's data-column block) that _clone_table's
+    per-cell border copy can't handle for the matrix table specifically,
+    since its column count/order changes per pool (sorted + possibly
+    grown), so there's no single fixed source cell to copy from."""
+    n_rows = table.Rows.Count
+    for c in after_cols:
+        for r in range(1, n_rows + 1):
+            try:
+                table.Cell(r, c).Borders(WD_BORDER_RIGHT).LineStyle = WD_LINE_STYLE_SINGLE
+            except Exception:
+                pass
 
 
 def _insert_pool_intro_before_table(doc, tables, table_index: int, heading_source, narrative_source, narrative_category: str):
@@ -461,17 +562,28 @@ def _insert_pool_intro_before_table(doc, tables, table_index: int, heading_sourc
     inside the table's own Cell(1,1) instead. Inserting BOTH paragraphs
     explicitly via the same InsertParagraphAfter() primitive (leaving the
     original separator as a harmless extra blank line before the table,
-    rather than trying to repurpose it) is what's actually reliable."""
+    rather than trying to repurpose it) is what's actually reliable.
+
+    Two blank spacer paragraphs are inserted first (same primitive, same
+    reasoning) so a newly-added pool's heading doesn't sit flush against
+    the previous pool's table -- visually separating one pool's block from
+    the next the same way page layout already separates the template's
+    original pool blocks."""
     preceding_table = tables(table_index - 1)
     end = preceding_table.Range.End
     doc.Range(end, end).InsertParagraphAfter()
-    new_heading = doc.Range(end, end).Paragraphs(1)
-    heading_end = end + 1
-    doc.Range(heading_end, heading_end).InsertParagraphAfter()
-    new_narrative = doc.Range(heading_end, heading_end).Paragraphs(1)
+    doc.Range(end + 1, end + 1).InsertParagraphAfter()
+    heading_start = end + 2
+    doc.Range(heading_start, heading_start).InsertParagraphAfter()
+    new_heading = doc.Range(heading_start, heading_start).Paragraphs(1)
+    narrative_start = heading_start + 1
+    doc.Range(narrative_start, narrative_start).InsertParagraphAfter()
+    new_narrative = doc.Range(narrative_start, narrative_start).Paragraphs(1)
 
     for src, dst in ((heading_source, new_heading), (narrative_source, new_narrative)):
         dst.Range.Font.Bold = src.Range.Font.Bold
+        dst.Range.Font.Italic = src.Range.Font.Italic
+        dst.Range.Font.Underline = src.Range.Font.Underline
         dst.Range.Font.Size = src.Range.Font.Size
         dst.Range.Font.Name = src.Range.Font.Name
         dst.Range.ParagraphFormat.Alignment = src.Range.ParagraphFormat.Alignment
@@ -483,6 +595,34 @@ def _insert_pool_intro_before_table(doc, tables, table_index: int, heading_sourc
             pass
 
     return new_heading, new_narrative
+
+
+def _insert_matrix_caption(doc, tables, table_index: int, source_para):
+    """Each pool's (*) 지역별/물건별 OPB 비중 matrix table has its own
+    caption paragraph sitting directly above it (confirmed by reading the
+    template: found once per pool, positioned between that pool's own
+    담보물지역별 data table and its matrix table) -- unlike the heading/
+    narrative pair above, its text is identical for every pool (a generic
+    section caption, not something computed per pool), so the source
+    paragraph's actual text is cloned directly rather than left blank for
+    a later rewrite. Reuses the same InsertParagraphAfter-on-the-preceding-
+    table primitive as _insert_pool_intro_before_table, for the same
+    table-boundary-safety reasons documented there."""
+    preceding_table = tables(table_index - 1)
+    end = preceding_table.Range.End
+    doc.Range(end, end).InsertParagraphAfter()
+    text = source_para.Range.Text.strip()
+    doc.Range(end, end).Paragraphs(1).Range.Text = text + "\r"
+    # Re-derive fresh, same reasoning as _replace_paragraph_text: the
+    # Paragraph object above is stale immediately after its own Range.Text
+    # assignment.
+    new_caption = doc.Range(end, end).Paragraphs(1)
+    new_caption.Range.Font.Bold = source_para.Range.Font.Bold
+    new_caption.Range.Font.Italic = source_para.Range.Font.Italic
+    new_caption.Range.Font.Size = source_para.Range.Font.Size
+    new_caption.Range.Font.Name = source_para.Range.Font.Name
+    new_caption.Range.ParagraphFormat.Alignment = source_para.Range.ParagraphFormat.Alignment
+    return new_caption
 
 
 def _extend_pool_table_block(doc, first_index: int, block_size: int,
@@ -535,7 +675,7 @@ def _collect_narrative_anchors(doc, stop_before_table) -> dict:
     cell instead, merging the sentence text into it. Matching by the
     sentence's own distinctive wording sidesteps that boundary ambiguity
     entirely."""
-    anchors = {"overall": [], "amount": [], "proptype": [], "region": [], "pool_heading": []}
+    anchors = {"overall": [], "amount": [], "proptype": [], "region": [], "pool_heading": [], "matrix_caption": []}
     limit = stop_before_table.Range.Start
     for p in doc.Paragraphs:
         if p.Range.Start >= limit:
@@ -545,6 +685,8 @@ def _collect_narrative_anchors(doc, stop_before_table) -> dict:
             continue
         if POOL_HEADING_RE.match(text):
             anchors["pool_heading"].append(p)
+        if "지역별/물건별 OPB 비중" in text:
+            anchors["matrix_caption"].append(p)
         category = _narrative_category(text)
         if category:
             anchors[category].append(p)
@@ -569,7 +711,9 @@ def _pool_composition_label(overall_summary_df: pd.DataFrame, pool: str) -> str:
 
 
 def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = None,
-                             flush_left: bool = False) -> None:
+                             flush_left: bool = False, bold: Optional[bool] = None,
+                             italic: Optional[bool] = None, underline: Optional[bool] = None,
+                             keep_with_next: bool = False) -> None:
     """Setting Range.Text on a Paragraph object leaves that same object
     pointing at the wrong (now-empty, differently-formatted) range
     afterward -- confirmed by testing: re-reading paragraph.Range.Text right
@@ -580,7 +724,20 @@ def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = No
     flush_left=True additionally zeroes the paragraph's left/first-line
     indent -- the template paragraph style carries an indent that made
     left-aligned text sit noticeably off the left margin -- and prepends
-    exactly one space so there's still a small, controlled gap instead."""
+    exactly one space so there's still a small, controlled gap instead.
+
+    bold/italic/underline, when not None, force that direct character
+    formatting on the new text -- used for the "Pool X (...)" sub-headings,
+    which must always render Bold+Italic+Underline regardless of whatever
+    direct formatting (or lack of it) happened to survive on the paragraph
+    this text is replacing.
+
+    keep_with_next=True sets KeepTogether/KeepWithNext on the FRESH
+    paragraph derived below, not on the caller's original `paragraph`
+    object -- setting it on the caller's object was confirmed by testing
+    to silently no-op (the property read back False on the saved document)
+    for exactly the same staleness reason the rest of this docstring
+    already covers for Range.Text/alignment."""
     if flush_left:
         text = " " + text
     start = paragraph.Range.Start
@@ -588,6 +745,15 @@ def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = No
     rng = doc.Range(start, start + len(text))
     if align is not None:
         rng.ParagraphFormat.Alignment = align
+    if bold is not None:
+        rng.Font.Bold = bold
+    if italic is not None:
+        rng.Font.Italic = italic
+    if underline is not None:
+        rng.Font.Underline = WD_UNDERLINE_SINGLE if underline else WD_UNDERLINE_NONE
+    if keep_with_next:
+        rng.Paragraphs(1).Format.KeepTogether = True
+        rng.Paragraphs(1).Format.KeepWithNext = True
     if flush_left:
         # This template's paragraphs use CJK "character unit" indentation
         # (CharacterUnitFirstLineIndent=6, i.e. a 6-character first-line
@@ -954,11 +1120,31 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
                     h_group.append(new_h)
                     n_list.append(new_n)
 
+            # Each pool's (*) 지역별/물건별 OPB 비중 matrix caption, same
+            # "clone for every extra pool" treatment as the heading/
+            # narrative pairs above -- but only one paragraph, and its text
+            # is identical for every pool, so it's cloned verbatim rather
+            # than left blank for a later per-pool rewrite.
+            mc_list = anchors["matrix_caption"]
+            for pool_idx in range(template_pools, n_pools):
+                if not mc_list:
+                    break
+                new_mc = _insert_matrix_caption(doc, tables, region_matrix_indices[pool_idx], mc_list[-1])
+                mc_list.append(new_mc)
+
+            # keep_with_next=True on both the heading and the narrative
+            # chains heading -> narrative -> (via KeepWithNext on the
+            # narrative, which Word treats as linking into whatever follows,
+            # including a table's first row) the table into one unbreakable
+            # unit: if the whole block doesn't fit in the remaining space on
+            # the current page, Word pushes the ENTIRE block onto a fresh
+            # page rather than splitting a pool's intro from its own table.
             for group in heading_groups:
                 for para, pool in zip(group, pools):
                     label = _pool_composition_label(t["overall_summary"], pool)
                     heading_text = f"Pool {pool} ({label})" if label else f"Pool {pool}"
-                    _replace_paragraph_text(doc, para, heading_text)
+                    _replace_paragraph_text(doc, para, heading_text, bold=True, italic=True, underline=True,
+                                             keep_with_next=True)
 
             if anchors["overall"]:
                 _replace_paragraph_text(doc, anchors["overall"][0],
@@ -967,17 +1153,17 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
             for para, pool in zip(anchors["amount"], pools):
                 pool_t = amt[amt["pool_type"] == pool]
                 _replace_paragraph_text(doc, para, narrative.amount_bucket_sentence(pool, pool_t),
-                                         align=WD_ALIGN_LEFT, flush_left=True)
+                                         align=WD_ALIGN_LEFT, flush_left=True, keep_with_next=True)
             pt = t["property_type"]
             for para, pool in zip(anchors["proptype"], pools):
                 pool_t = pt[pt["pool_type"] == pool]
                 _replace_paragraph_text(doc, para, narrative.property_type_sentence(pool, pool_t),
-                                         align=WD_ALIGN_LEFT, flush_left=True)
+                                         align=WD_ALIGN_LEFT, flush_left=True, keep_with_next=True)
             rg = t["region"]
             for para, pool in zip(anchors["region"], pools):
                 pool_t = rg[rg["pool_type"] == pool]
                 _replace_paragraph_text(doc, para, narrative.region_sentence(pool, pool_t),
-                                         align=WD_ALIGN_LEFT, flush_left=True)
+                                         align=WD_ALIGN_LEFT, flush_left=True, keep_with_next=True)
 
             # --- now rebuild every table's data rows ---
             rows1, dividers1 = _rows_overall_summary(t["overall_summary"], config)
@@ -1007,8 +1193,22 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
                 rows, top_groups = _rows_group_breakdown(pool_t, "region")
                 _rebuild_table(tables(table_idx), rows)
                 pool_mx = mx[mx["pool_type"] == pool]
-                _rewrite_matrix_header(tables(matrix_idx), prop_groups)
-                _rebuild_table(tables(matrix_idx), _rows_matrix(pool_mx, prop_groups, top_groups))
+                # Each pool's own composition ratio decides ITS matrix
+                # table's column order (highest-share property type first),
+                # not one fixed order shared by every pool.
+                sorted_groups = _sorted_prop_groups(pool_mx, prop_groups)
+                matrix_table = tables(matrix_idx)
+                # This template's matrix tables were each last built for a
+                # different prior deal's group count -- some have fewer
+                # data-column slots than this deal's actual group count
+                # needs; growing them first (a no-op when there's already
+                # enough room) keeps _rewrite_matrix_header from overflowing
+                # the last group's name into what should be the 합계 column.
+                _ensure_matrix_columns(matrix_table, len(sorted_groups))
+                _rewrite_matrix_header(matrix_table, sorted_groups)
+                _rebuild_table(matrix_table, _rows_matrix(pool_mx, sorted_groups, top_groups))
+                n_matrix_cols = matrix_table.Columns.Count
+                _set_vertical_dividers(matrix_table, [1, n_matrix_cols - 1])
 
             for table_idx in group_tables:
                 _set_row_height(tables(table_idx), GROUP_TABLE_ROW_HEIGHT_CM)
