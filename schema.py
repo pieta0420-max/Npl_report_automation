@@ -60,7 +60,8 @@ BORROWER = SheetSchema(
     columns=[
         ColumnDef("serial_no", "일련번호", "Serial Number", category="Borrower Identification Information"),
         ColumnDef("pool_type", "Pool 구분", "Pool Type", category="Borrower Identification Information"),
-        ColumnDef("asset_type", "자산유형", "Asset Type", category="Borrower Identification Information"),
+        ColumnDef("asset_type", "자산유형", "Asset Type", category="Borrower Identification Information",
+                   aliases=("채권구분",)),
         ColumnDef("borrower_control_no", "차주관리번호", "Borrower Control Number", category="Borrower Identification Information"),
         ColumnDef("borrower_name", "차주명", "Borrower Name", category="Borrower Identification Information"),
         ColumnDef("borrower_type", "차주형태", "Type of Borrower", category="Borrower Identification Information"),
@@ -92,7 +93,8 @@ COLLATERAL = SheetSchema(
     columns=[
         ColumnDef("serial_no", "일련번호", "Serial Number", category="Borrower Identification Information"),
         ColumnDef("pool_type", "Pool 구분", "Pool Type", category="Borrower Identification Information"),
-        ColumnDef("asset_type", "자산유형", "Asset Type", category="Borrower Identification Information"),
+        ColumnDef("asset_type", "자산유형", "Asset Type", category="Borrower Identification Information",
+                   aliases=("채권구분",)),
         ColumnDef("borrower_control_no", "차주관리번호", "Borrower Control Number", category="Borrower Identification Information"),
         ColumnDef("borrower_name", "차주명", "Borrower Name", category="Borrower Identification Information"),
         ColumnDef("property_serial_no", "Property 일련번호", "Property Serial Number", category="Property Basic Information"),
@@ -102,7 +104,8 @@ COLLATERAL = SheetSchema(
         ColumnDef("appraisal_amount_total", "감정평가액 합계", "Appraisal Amount- Total", category="Appraisal Information"),
         ColumnDef("opb", "OPB", "OPB", derived=True, category="Claim Amount (안분계산)"),
         ColumnDef("claim_amount", "채권액", "Claim Amount", derived=True, category="Claim Amount (안분계산)"),
-        ColumnDef("foreclosure_status", "경매개시 FiledNot Filed", "Foreclosure - Status", category="Foreclosure Information"),
+        ColumnDef("foreclosure_status", "경매개시 FiledNot Filed", "Foreclosure - Status", category="Foreclosure Information",
+                   aliases=("경매 개시여부", "경매개시여부")),
     ],
 )
 
@@ -114,7 +117,8 @@ GUARANTEE = SheetSchema(
     columns=[
         ColumnDef("serial_no", "일련번호", "Serial Number", category="Borrower Identification Information"),
         ColumnDef("pool_type", "Pool 구분", "Pool Type", category="Borrower Identification Information"),
-        ColumnDef("asset_type", "자산유형", "Asset Type", category="Borrower Identification Information"),
+        ColumnDef("asset_type", "자산유형", "Asset Type", category="Borrower Identification Information",
+                   aliases=("채권구분",)),
         ColumnDef("borrower_control_no", "차주관리번호", "Borrower Control Number", category="Borrower Identification Information"),
         ColumnDef("borrower_name", "차주명", "Borrower Name", category="Borrower Identification Information"),
         ColumnDef("loan_control_no", "관련 채권 일련번호", "Loan Control Number", category="Letter of Credit Guarantee Information"),
@@ -142,7 +146,8 @@ REHAB = SheetSchema(
     columns=[
         ColumnDef("serial_no", "일련번호", "Serial Number", category="Borrower Identification Information"),
         ColumnDef("pool_type", "Pool 구분", "Pool Type", category="Borrower Identification Information"),
-        ColumnDef("asset_type", "자산유형", "Asset Type", category="Borrower Identification Information"),
+        ColumnDef("asset_type", "자산유형", "Asset Type", category="Borrower Identification Information",
+                   aliases=("채권구분",)),
         ColumnDef("borrower_control_no", "차주관리번호", "Borrower Control Number", category="Borrower Identification Information"),
         ColumnDef("borrower_name", "차주명", "Borrower Name", category="Borrower Identification Information"),
         ColumnDef("approved", "인가/미인가", "Approved / Not Approved", category="General Understanding of the Subject Company"),

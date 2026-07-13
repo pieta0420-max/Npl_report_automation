@@ -302,7 +302,7 @@ def table_region_x_property_matrix(collateral_df: pd.DataFrame, config: dict,
 # ---------------------------------------------------------------------------
 
 def table_foreclosure(collateral_df: pd.DataFrame) -> pd.DataFrame:
-    labels = {"Filed": "경매 개시", "Not Filed": "경매 미개시"}
+    labels = {"Filed": "경매 개시", "Not Filed": "경매 미개시", "Y": "경매 개시", "N": "경매 미개시"}
     rows = []
     for pool in sorted(x for x in collateral_df["pool_type"].dropna().unique()):
         pool_df = collateral_df[collateral_df["pool_type"] == pool]

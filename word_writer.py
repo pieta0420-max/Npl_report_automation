@@ -231,6 +231,158 @@ def _set_pool_column_dividers(table, pool_block_last_rows: List[int], header_row
         table.Cell(table.Rows.Count, 1).Borders(WD_BORDER_BOTTOM).LineStyle = WD_LINE_STYLE_SINGLE
 
 
+def _cell_text(cell) -> str:
+    """Cell.Range.Text always carries a trailing cell-end marker (\\x07,
+    preceded by \\r if the cell holds a full paragraph) that str.strip()
+    doesn't remove since it isn't whitespace -- left in, a blank cell reads
+    back as '\\x07' instead of '', which silently breaks exact-text
+    comparisons (e.g. every "blank" cell then looks like a distinct,
+    non-empty value)."""
+    return cell.Range.Text.replace("\r", "").replace("\x07", "").strip()
+
+
+def _detect_template_pool_count(table1) -> int:
+    """The template's per-pool table sections (금액별/담보물종류별/담보물
+    지역별) are physical tables, one set per pool -- unlike 총괄표 itself,
+    which embeds every pool as rows in a single table and so is already
+    pool-count-agnostic. A template built for a prior deal with fewer (or
+    more) pools than the current one won't have the right number of table
+    slots. Read this BEFORE any table is rebuilt: the template's own
+    still-intact 총괄표 (from whatever deal it was last used for) already
+    lists each pool's letter in column 1, so counting the distinct
+    non-empty entries there tells us how many pools the template's table
+    sections were actually built for."""
+    pools = set()
+    for r in range(2, table1.Rows.Count + 1):
+        text = _cell_text(table1.Cell(r, 1))
+        if text and text not in ("Pool", "합계"):
+            pools.add(text)
+    return len(pools) if pools else 1
+
+
+def _detect_header_rows(table, pools) -> int:
+    """Tables with a Pool column per row (경매/회생/신용보증서) are normally
+    assumed to have a single header row, but this template's 신용보증서
+    table turned out to have 2 (a merged category row plus a sub-label
+    row) -- rebuilding from row 2 then clobbered the real sub-label row and
+    crashed trying to delete a row inside a vertical merge. Detecting the
+    true header row count directly, by finding the first row whose column
+    1 is one of the deal's actual pool letters, sidesteps assuming any
+    fixed header shape."""
+    pool_set = set(pools)
+    for r in range(1, table.Rows.Count + 1):
+        try:
+            text = _cell_text(table.Cell(r, 1))
+        except Exception:
+            continue
+        if text in pool_set:
+            return r - 1
+    return 1
+
+
+def _unmerge_header_vertical_cells(table, header_rows: int) -> None:
+    """A vertically-merged header cell (e.g. "Pool" spanning both header
+    rows) makes Rows.Delete() fail on ANY row in the table -- confirmed by
+    testing: deleting the first data row and deleting the last row both
+    failed identically with the same Word COM error, even though neither
+    row was itself part of the merge. Splitting the merge back into one
+    cell per row sidesteps this; our rebuild never touches header rows
+    anyway, so losing the merge there has no effect on the content we
+    write, and the header's own text (already correct from the template)
+    is preserved -- Split() keeps existing text in the first resulting
+    cell and leaves the rest blank."""
+    if header_rows < 2:
+        return
+    n_cols = table.Columns.Count
+    for c in range(1, n_cols + 1):
+        try:
+            table.Cell(2, c)
+        except Exception:
+            table.Cell(1, c).Split(NumRows=header_rows, NumColumns=1)
+
+
+def _clone_table(doc, source_index: int, insert_after_index: int) -> None:
+    """Copies the table at source_index (1-based, re-read fresh so this is
+    safe to call repeatedly as indices shift with each insertion) and
+    inserts the duplicate immediately after the table at insert_after_index
+    (may be the same table, or a different one -- used to grow a per-pool
+    table block by cloning the last pool's table(s) onto the end of the
+    section). Pasting a copied table's Range directly against another
+    table's end merges the two into one (confirmed by testing -- row counts
+    added together instead of a new Tables entry appearing); inserting an
+    empty paragraph first, then pasting after THAT, keeps them separate."""
+    import pythoncom
+
+    src = doc.Tables(source_index)
+    target = doc.Tables(insert_after_index)
+    end = target.Range.End
+    gap = doc.Range(end, end)
+    gap.InsertParagraphAfter()
+    new_pos = end + 1
+    src.Range.Copy()
+    pythoncom.PumpWaitingMessages()
+    doc.Range(new_pos, new_pos).Paste()
+    pythoncom.PumpWaitingMessages()
+
+
+def _rewrite_matrix_header(table, prop_groups: List[str]) -> None:
+    """Unlike every other table's header (fixed labels like Pool/구분 that
+    never change deal to deal, so leaving them untouched is exactly what we
+    want), the (*) 지역별/물건별 OPB 비중 matrix's header names the deal's
+    actual property-type groups -- which come from classification_config
+    .json and can differ from whatever group set the template's original
+    deal happened to use. Left untouched, the template's old column labels
+    (e.g. a stale group name from a prior deal) end up sitting over this
+    deal's differently-ordered/differently-named data."""
+    headers = ["구분"] + list(prop_groups) + ["합계"]
+    for i in range(min(len(headers), table.Columns.Count)):
+        table.Cell(1, i + 1).Range.Text = headers[i]
+
+
+def _clone_paragraph_after(doc, paragraph):
+    """Duplicates a narrative paragraph (with its formatting) and inserts
+    the copy immediately after it -- used when the template has fewer
+    instances of a given narrative sentence than the deal has pools (e.g.
+    a template built for 3 pools has no 4th "Pool D" sentence slot at
+    all). Returns the newly created Paragraph object."""
+    import pythoncom
+
+    end = paragraph.Range.End
+    paragraph.Range.Copy()
+    pythoncom.PumpWaitingMessages()
+    doc.Range(end, end).Paste()
+    pythoncom.PumpWaitingMessages()
+    return doc.Range(end, end + 1).Paragraphs(1)
+
+
+def _ensure_anchor_count(doc, anchors: list, target_count: int) -> None:
+    """Extends an anchors list (from _collect_narrative_anchors) up to
+    target_count by cloning its last entry, once per missing pool."""
+    while anchors and len(anchors) < target_count:
+        anchors.append(_clone_paragraph_after(doc, anchors[-1]))
+
+
+def _extend_pool_table_block(doc, first_index: int, block_size: int,
+                              template_pools: int, target_pools: int) -> None:
+    """A "block" is `block_size` consecutive tables per pool (1 for a plain
+    per-pool table, 2 for a data+matrix pair), repeated `template_pools`
+    times starting at `first_index`. If the deal has more pools than the
+    template was built for, clones the LAST pool's block onto the end of
+    the section, once per extra pool, so it ends up `target_pools` blocks
+    wide before any content is written into it."""
+    extra = target_pools - template_pools
+    if extra <= 0:
+        return
+    last_index = first_index + template_pools * block_size - 1
+    for _ in range(extra):
+        block_start = last_index - block_size + 1
+        insert_after = last_index
+        for offset in range(block_size):
+            _clone_table(doc, block_start + offset, insert_after)
+            insert_after += 1
+        last_index = insert_after
+
+
 def _collect_narrative_anchors(doc, stop_before_table) -> dict:
     """One pass over the paragraphs in pages 1-9 (up to stop_before_table's
     start), bucketing the 4 kinds of intro sentence by a distinctive keyword
@@ -582,10 +734,40 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
             tables = doc.Tables
             amt = t["amount_bucket"]
             pools = sorted(p for p in amt["pool_type"].unique())
+            n_pools = len(pools)
+
+            # --- the template's 금액별/담보물종류별/담보물지역별 sections are
+            # physical tables, one set per pool (unlike 총괄표 itself, which
+            # embeds every pool as rows in one table and needs no extra
+            # slots). If this deal has more pools than the template was
+            # last used for, clone the last pool's table(s) onto the end of
+            # each section BEFORE writing anything, so there's a slot for
+            # every pool. Must run in this order -- each section's start
+            # index depends on the (now-extended) width of the ones before it. ---
+            template_pools = _detect_template_pool_count(tables(1))
+            _extend_pool_table_block(doc, 3, 1, template_pools, n_pools)
+            proptype_start = 3 + n_pools
+            _extend_pool_table_block(doc, proptype_start, 1, template_pools, n_pools)
+            region_start = proptype_start + n_pools
+            _extend_pool_table_block(doc, region_start, 2, template_pools, n_pools)
+            tables = doc.Tables  # re-fetch: table insertions invalidate any cached collection
+
+            amount_indices = list(range(3, 3 + n_pools))
+            proptype_indices = list(range(3 + n_pools, 3 + 2 * n_pools))
+            region_data_indices = [3 + 2 * n_pools + 2 * i for i in range(n_pools)]
+            region_matrix_indices = [i + 1 for i in region_data_indices]
+            foreclosure_idx = 3 + 4 * n_pools
+            rehab_idx = 4 + 4 * n_pools
+            guarantee_idx = 5 + 4 * n_pools
 
             # --- collect all 4 kinds of intro sentence in one pass, THEN
             # rewrite them (left-aligned), before touching any table ---
-            anchors = _collect_narrative_anchors(doc, tables(11))
+            anchors = _collect_narrative_anchors(doc, tables(foreclosure_idx))
+            # template built for fewer pools than this deal has -> no Nth
+            # narrative sentence slot exists yet for the extra pool(s)
+            _ensure_anchor_count(doc, anchors["amount"], n_pools)
+            _ensure_anchor_count(doc, anchors["proptype"], n_pools)
+            _ensure_anchor_count(doc, anchors["region"], n_pools)
             if anchors["overall"]:
                 _replace_paragraph_text(doc, anchors["overall"][0],
                                          narrative.overall_summary_sentence(bank_name, borrower_df),
@@ -616,41 +798,45 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
             _set_pool_column_dividers(tables(2), dividers2)
             _merge_pool_and_category(tables(2), 1 + len(rows2), "합계")
 
-            for pool, table_idx in zip(pools, [3, 4]):
+            for pool, table_idx in zip(pools, amount_indices):
                 pool_t = amt[amt["pool_type"] == pool]
                 _rebuild_table(tables(table_idx), _rows_amount_bucket(pool_t))
 
-            group_tables = [5, 6, 7, 9]
-            for pool, table_idx in zip(pools, [5, 6]):
+            group_tables = list(proptype_indices) + list(region_data_indices)
+            for pool, table_idx in zip(pools, proptype_indices):
                 pool_t = pt[pt["pool_type"] == pool]
                 rows, _ = _rows_group_breakdown(pool_t, "property_type")
                 _rebuild_table(tables(table_idx), rows)
 
             mx = t["region_x_property"]
             prop_groups = [c for c in mx.columns if c not in ("pool_type", "region_group")]
-            for pool, table_idx, matrix_idx in zip(pools, [7, 9], [8, 10]):
+            for pool, table_idx, matrix_idx in zip(pools, region_data_indices, region_matrix_indices):
                 pool_t = rg[rg["pool_type"] == pool]
                 rows, top_groups = _rows_group_breakdown(pool_t, "region")
                 _rebuild_table(tables(table_idx), rows)
                 pool_mx = mx[mx["pool_type"] == pool]
+                _rewrite_matrix_header(tables(matrix_idx), prop_groups)
                 _rebuild_table(tables(matrix_idx), _rows_matrix(pool_mx, prop_groups, top_groups))
 
             for table_idx in group_tables:
                 _set_row_height(tables(table_idx), GROUP_TABLE_ROW_HEIGHT_CM)
 
-            # --- 2.4/2.5/2.6: 경매/회생/신용보증서 (Tables 11/12/13, no narrative) ---
+            # --- 2.4/2.5/2.6: 경매/회생/신용보증서 (no narrative) ---
             rows11, dividers11 = _rows_foreclosure(t["foreclosure"])
-            _rebuild_table(tables(11), rows11, skip_highlight_cols={1})
-            _set_pool_column_dividers(tables(11), dividers11, close_bottom=True)
+            _rebuild_table(tables(foreclosure_idx), rows11, skip_highlight_cols={1})
+            _set_pool_column_dividers(tables(foreclosure_idx), dividers11, close_bottom=True)
 
             rows12, dividers12 = _rows_rehab(t["rehab"])
-            _rebuild_table(tables(12), rows12, skip_highlight_cols={1})
-            _set_pool_column_dividers(tables(12), dividers12, close_bottom=True)
+            _rebuild_table(tables(rehab_idx), rows12, skip_highlight_cols={1})
+            _set_pool_column_dividers(tables(rehab_idx), dividers12, close_bottom=True)
 
-            _rebuild_table(tables(13), _rows_guarantee(t["guarantee"]))
+            guarantee_table = tables(guarantee_idx)
+            guarantee_header_rows = _detect_header_rows(guarantee_table, pools)
+            _unmerge_header_vertical_cells(guarantee_table, guarantee_header_rows)
+            _rebuild_table(guarantee_table, _rows_guarantee(t["guarantee"]), header_rows=guarantee_header_rows)
 
             # --- keep every table intact across a page break ---
-            for table_idx in range(1, 14):
+            for table_idx in range(1, guarantee_idx + 1):
                 _keep_table_together(tables(table_idx))
 
             doc.Save()

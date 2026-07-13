@@ -3,7 +3,9 @@
   "amount_bucket_labels": ["100억 이상", "50억 이상", "30억 이상", "10억 이상", "10억 미만"],
   "asset_type_labels": {
     "Regular": "일반담보부",
-    "Special": "특별담보부"
+    "Special": "특별담보부",
+    "R": "일반담보부",
+    "S": "특별담보부"
   },
   "property_type_aliases": {
     "상가": "근린상가",
