@@ -176,6 +176,31 @@ def _rebuild_table(table, rows: List[RowSpec], header_rows: int = 1,
                 cell.Borders(WD_BORDER_BOTTOM).LineStyle = WD_LINE_STYLE_SINGLE
 
 
+def _widen_group_label_column(table, extra_cm: float = 1.4) -> None:
+    """The 담보물 종류별/지역별 표's column 7 (유사유형 구성비) doubles as
+    the "(그룹명)" label cell -- e.g. "(특수부동산)", "(기계기구 등)" --
+    and the template's original column width was sized for this app's
+    OLDER, shorter group names (양도담보/동산담보/기타 etc, all <=4
+    characters). The newer, longer group names wrap onto a second line
+    within that narrow column, which _set_row_height's fixed (not
+    auto-growing) row height then clips -- confirmed by testing: "특수
+    부동산" rendered as "특수부동" with the last character cut off.
+    Widening column 7 by extra_cm, taken evenly from columns 1-6, gives
+    long labels room to fit on one line without needing a taller row."""
+    n_cols = table.Columns.Count
+    extra_pt = extra_cm * CM_TO_PT
+    shrink_per_col = extra_pt / (n_cols - 1)
+    for c in range(1, n_cols):
+        try:
+            table.Columns(c).Width -= shrink_per_col
+        except Exception:
+            pass
+    try:
+        table.Columns(n_cols).Width += extra_pt
+    except Exception:
+        pass
+
+
 def _set_row_height(table, cm: float, header_rows: int = 1) -> None:
     """Applies a fixed (not merely minimum) row height to every data row --
     Rows.Add() rows inherited an oversized default height, and 'unify' means
@@ -428,6 +453,28 @@ def _rewrite_matrix_header(table, prop_groups: List[str]) -> None:
         table.Cell(1, i + 1).Range.Text = headers[i]
 
 
+def _normalize_matrix_header_style(table) -> None:
+    """Some of this template's matrix tables have a pre-existing
+    inconsistency where a couple of header cells' Font.Color don't match
+    the rest of the row (e.g. a stray theme-color reference instead of
+    plain white), invisible in the original template because those
+    columns always held the same group name. Per-pool column reordering
+    (_rewrite_matrix_header) can route any group's name into any physical
+    column, so that latent inconsistency now surfaces unpredictably.
+    Column 1 (구분) is never reordered or grown, so it's used as the
+    reference style for every other header cell in row 1."""
+    ref_cell = table.Cell(1, 1)
+    ref_color = ref_cell.Range.Font.Color
+    ref_shading = ref_cell.Shading.BackgroundPatternColor
+    for c in range(2, table.Columns.Count + 1):
+        try:
+            cell = table.Cell(1, c)
+            cell.Range.Font.Color = ref_color
+            cell.Shading.BackgroundPatternColor = ref_shading
+        except Exception:
+            pass
+
+
 def _sorted_prop_groups(pool_matrix: pd.DataFrame, prop_groups: List[str]) -> List[str]:
     """Orders this POOL's own property-type-group columns by that pool's
     own composition ratio (the column's summed share across every region
@@ -463,12 +510,20 @@ def _ensure_matrix_columns(table, n_groups: int) -> None:
     original_total_width = sum(table.Columns(c).Width for c in range(1, table.Columns.Count + 1))
 
     if extra > 0:
-        ref_header_cell = table.Cell(1, 2)  # an existing data-group header cell, used as the new columns' format template
         insert_before_idx = table.Columns.Count  # 합계's current position
         for _ in range(extra):
             table.Columns.Add(BeforeColumn=table.Columns(insert_before_idx))
             insert_before_idx += 1
         n_cols = table.Columns.Count
+        # Fetched AFTER Columns.Add() completes, not before: confirmed by
+        # testing that a cell reference captured before the insertion
+        # silently failed every property read against it afterward (caught
+        # by the bare except below, so the new column's header ended up
+        # with neither the shading nor the white font every other header
+        # cell has -- the exact same COM staleness issue documented at
+        # length elsewhere in this file for Range/Paragraph objects, just
+        # for a Cell object instead).
+        ref_header_cell = table.Cell(1, 2)  # an existing data-group header cell, used as the new columns' format template
         for c in range(current_data_cols + 2, n_cols):
             try:
                 new_header_cell = table.Cell(1, c)
@@ -500,14 +555,25 @@ def _ensure_matrix_columns(table, n_groups: int) -> None:
 
 
 def _set_vertical_dividers(table, after_cols: List[int]) -> None:
-    """Draws a single vertical line on the RIGHT edge of each column in
-    after_cols (1-indexed), for every row including the header -- used for
-    the interior column dividers (e.g. between 구분/차주수, or on either
-    side of the (*) matrix's data-column block) that _clone_table's
-    per-cell border copy can't handle for the matrix table specifically,
-    since its column count/order changes per pool (sorted + possibly
-    grown), so there's no single fixed source cell to copy from."""
+    """Clears every interior vertical border in the table first (the
+    (*) matrix table otherwise keeps a plain grid line between every pair
+    of data columns, inherited from the template's default table style --
+    not something any of this file's code ever explicitly draws, so
+    there's nothing else that would clear it), then draws a single
+    vertical line on the RIGHT edge of each column in after_cols
+    (1-indexed), for every row including the header -- used for the
+    interior column dividers this matrix table specifically wants (on
+    either side of the whole data-column block, not between individual
+    data columns)."""
     n_rows = table.Rows.Count
+    n_cols = table.Columns.Count
+    for r in range(1, n_rows + 1):
+        for c in range(1, n_cols + 1):
+            try:
+                table.Cell(r, c).Borders(WD_BORDER_LEFT).LineStyle = WD_LINE_STYLE_NONE
+                table.Cell(r, c).Borders(WD_BORDER_RIGHT).LineStyle = WD_LINE_STYLE_NONE
+            except Exception:
+                pass
     for c in after_cols:
         for r in range(1, n_rows + 1):
             try:
@@ -730,7 +796,7 @@ def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = No
                              flush_left: bool = False, bold: Optional[bool] = None,
                              italic: Optional[bool] = None, underline: Optional[bool] = None,
                              keep_with_next: bool = False, page_break_before: bool = False,
-                             insert_blank_after: bool = False) -> None:
+                             space_after_line: bool = False) -> None:
     """Setting Range.Text on a Paragraph object leaves that same object
     pointing at the wrong (now-empty, differently-formatted) range
     afterward -- confirmed by testing: re-reading paragraph.Range.Text right
@@ -760,14 +826,16 @@ def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = No
     page (used for 담보물 종류별/지역별 분류's pool headings, one pool per
     page, from the 2nd pool of that section onward).
 
-    insert_blank_after=True inserts a single blank paragraph immediately
-    after this one's own paragraph mark (position computed directly, no
-    later re-query) -- used to put a visible one-line gap between a pool's
-    heading and its own narrative sentence below it. Safe to insert here
-    despite the table-boundary staleness issues documented at length
-    elsewhere in this file: this position is a plain body paragraph
-    boundary, nowhere near a table, which is what all of those issues were
-    actually specific to."""
+    space_after_line=True sets a Korean-layout "1 line" gap (Format.
+    LineUnitAfter, the same East-Asian line-unit spacing this template
+    already uses for indentation) after this paragraph, for a pool
+    heading's visible gap above its own narrative sentence. An earlier
+    version of this instead inserted an actual blank paragraph there --
+    confirmed by testing (the user directly measuring the result) that
+    this reads as a 2-line gap, not 1, since it stacks on top of the
+    paragraph spacing Word was already applying between any two
+    paragraphs; a pure spacing property produces the requested single
+    line without adding a second, competing source of vertical space."""
     if flush_left:
         text = " " + text
     start = paragraph.Range.Start
@@ -786,6 +854,8 @@ def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = No
         rng.Paragraphs(1).Format.KeepWithNext = True
     if page_break_before:
         rng.Paragraphs(1).Format.PageBreakBefore = True
+    if space_after_line:
+        rng.Paragraphs(1).Format.LineUnitAfter = 1
     if flush_left:
         # This template's paragraphs use CJK "character unit" indentation
         # (CharacterUnitFirstLineIndent=6, i.e. a 6-character first-line
@@ -800,9 +870,6 @@ def _replace_paragraph_text(doc, paragraph, text: str, align: Optional[int] = No
         fresh_para.Format.LeftIndent = 0
         fresh_para.Format.RightIndent = 0
         fresh_para.Format.FirstLineIndent = 0
-    if insert_blank_after:
-        end_pos = start + len(text) + 1
-        doc.Range(end_pos, end_pos).InsertParagraphAfter()
 
 
 # ---------------------------------------------------------------------------
@@ -927,14 +994,14 @@ def _rows_group_breakdown(pool_table: pd.DataFrame, label_key: str):
     The group-rollup columns (5-7) are populated only on each group's first
     row; the group's own name is written as "(그룹명)" into column 7 (유사
     유형구성비), right-aligned, on the row directly below that first row --
-    or, for a single-member group, on that SAME (only) row, rather than an
-    extra row inserted just to carry the label: an extra, otherwise-blank
-    row for a one-member group reads as a formatting glitch (a near-empty
-    row sandwiched between real data) more than as an intentional label,
-    so it's dropped in favor of just treating that single row as any other
-    data row. A divider line separates each group's block from the next.
-    Every row belonging to one of the top-2 groups by share is
-    highlighted."""
+    or, for a single-member group, on an extra row inserted just for the
+    label, since column 7 of that single row is already holding the
+    group's own real 구성비 number (an earlier version of this function
+    tried writing the label into that same cell instead of adding a row,
+    which silently overwrote and lost that percentage -- confirmed by
+    testing against a real single-member group). A divider line separates
+    each group's block from the next. Every row belonging to one of the
+    top-2 groups by share is highlighted."""
     rows: List[RowSpec] = []
     data = pool_table[pool_table["row_kind"] == "data"]
     top_groups = _top_groups(pool_table, 2)
@@ -960,9 +1027,10 @@ def _rows_group_breakdown(pool_table: pd.DataFrame, label_key: str):
 
         if len(items) >= 2:
             rows[block_start + 1].cells[6] = R(f"({group_name})")
+            block_last = rows[-1]  # the block's true last row, not the label row
         else:
-            rows[block_start].cells[6] = R(f"({group_name})")
-        block_last = rows[-1]  # the block's true last row, not necessarily the label row
+            block_last = RowSpec([L(""), R(""), R(""), R(""), R(""), R(""), R(f"({group_name})")], highlight=hl)
+            rows.append(block_last)
 
         if block_idx < len(blocks) - 1:
             block_last.border_bottom = True
@@ -1096,6 +1164,21 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
             pools = sorted(p for p in amt["pool_type"].unique())
             n_pools = len(pools)
 
+            # --- "2. 매각대상채권의 분포" (the parent section header for all
+            # of 2.1 금액별 분류 through 2.6 신용보증서, i.e. everything
+            # from here through the amount tables onward) always starts on
+            # its own fresh page -- searched for by content, not a fixed
+            # paragraph index, and matched with internal spacing stripped
+            # since the template's own text may or may not have a space
+            # after "2." ---
+            section2_limit = tables(3).Range.Start
+            for p in doc.Paragraphs:
+                if p.Range.Start >= section2_limit:
+                    break
+                if "매각대상채권의분포" in p.Range.Text.strip().replace(" ", ""):
+                    p.Format.PageBreakBefore = True
+                    break
+
             # --- the template's 금액별/담보물종류별/담보물지역별 sections are
             # physical tables, one set per pool (unlike 총괄표 itself, which
             # embeds every pool as rows in one table and needs no extra
@@ -1183,7 +1266,7 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
             # inserted pool's heading (e.g. Pool D) inherits whatever
             # indent its cloned paragraph happened to carry and visibly
             # sits off the left margin compared to the template's own
-            # pool headings. insert_blank_after=True puts one blank line
+            # pool headings. space_after_line=True puts a one-line gap
             # between the heading and its own narrative sentence below it.
             # page_break_before=True, for 담보물종류별(index 1)/지역별
             # (index 2) only and only from the 2nd pool onward, makes each
@@ -1197,7 +1280,7 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
                     page_break = section_idx in (1, 2) and pool_idx > 0
                     _replace_paragraph_text(doc, para, heading_text, bold=True, italic=True, underline=True,
                                              keep_with_next=True, align=WD_ALIGN_LEFT, flush_left=True,
-                                             page_break_before=page_break, insert_blank_after=True)
+                                             page_break_before=page_break, space_after_line=True)
 
             if anchors["overall"]:
                 _replace_paragraph_text(doc, anchors["overall"][0],
@@ -1238,6 +1321,7 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
                 pool_t = pt[pt["pool_type"] == pool]
                 rows, _ = _rows_group_breakdown(pool_t, "property_type")
                 _rebuild_table(tables(table_idx), rows)
+                _widen_group_label_column(tables(table_idx))
 
             mx = t["region_x_property"]
             prop_groups = [c for c in mx.columns if c not in ("pool_type", "region_group")]
@@ -1245,6 +1329,7 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
                 pool_t = rg[rg["pool_type"] == pool]
                 rows, top_groups = _rows_group_breakdown(pool_t, "region")
                 _rebuild_table(tables(table_idx), rows)
+                _widen_group_label_column(tables(table_idx))
                 pool_mx = mx[mx["pool_type"] == pool]
                 # Each pool's own composition ratio decides ITS matrix
                 # table's column order (highest-share property type first),
@@ -1259,6 +1344,7 @@ def build_word_report(template_path: str, output_path: str, agg_result, frames: 
                 # the last group's name into what should be the 합계 column.
                 _ensure_matrix_columns(matrix_table, len(sorted_groups))
                 _rewrite_matrix_header(matrix_table, sorted_groups)
+                _normalize_matrix_header_style(matrix_table)
                 _rebuild_table(matrix_table, _rows_matrix(pool_mx, sorted_groups, top_groups))
                 n_matrix_cols = matrix_table.Columns.Count
                 _set_vertical_dividers(matrix_table, [1, n_matrix_cols - 1])
